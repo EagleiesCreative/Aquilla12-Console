@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "ip": "127.0.0.1",
+  "base_port": 5004,
+  "port_step": 2
+}

@@ -25,6 +25,10 @@ export interface ChannelState {
   volume: number;
   srtpEnabled?: boolean;
   sipAuthRequired?: boolean;
+  ampIp?: string;
+  ampPort?: number;
+  ampStreaming?: boolean;
+  ampEnabled?: boolean;
 }
 
 export interface GlobalSettings {
@@ -35,6 +39,7 @@ export interface GlobalSettings {
   selectedDevice: string;
   availableDevices: string[];
   localIp?: string;
+  ampEnabled?: boolean;
 }
 
 export type LogLevel = 'info' | 'success' | 'warning' | 'error' | 'sip_tx' | 'sip_rx';

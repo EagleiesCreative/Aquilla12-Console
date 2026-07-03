@@ -33,6 +33,10 @@ const INITIAL_CHANNELS: ChannelState[] = Array.from({ length: 12 }).map((_, inde
     volume: 100,
     srtpEnabled: true,
     sipAuthRequired: true,
+    ampIp: "127.0.0.1",
+    ampPort: 5004 + index * 2,
+    ampStreaming: false,
+    ampEnabled: true,
   };
 });
 
@@ -45,6 +49,7 @@ export default function Home() {
     isConnected: false,
     selectedDevice: "",
     availableDevices: [],
+    ampEnabled: true,
   });
 
   const [channels, setChannels] = useState<ChannelState[]>(INITIAL_CHANNELS);
@@ -96,11 +101,13 @@ export default function Home() {
         let initialSipPort = "5060";
         let initialDevice = "";
         let initialLocalIp = "";
+        let initialAmpEnabled = true;
         if (configRes.ok) {
           const cfg = await configRes.json();
           initialSipPort = cfg.sipPort || "5060";
           initialDevice = cfg.selectedDevice || "";
           initialLocalIp = cfg.localIp || "";
+          if (cfg.ampEnabled !== undefined) initialAmpEnabled = cfg.ampEnabled;
         }
 
         const res = await fetch(`${parsed.httpUrl}/api/audio-devices`);
@@ -121,6 +128,7 @@ export default function Home() {
               selectedDevice: defaultDevice,
               sipPort: initialSipPort,
               localIp: initialLocalIp || prev.localIp,
+              ampEnabled: initialAmpEnabled,
             };
           });
         }
@@ -243,6 +251,7 @@ export default function Home() {
                 rxKbps: 80,
                 txKbps: 0,
                 pttActive: false,
+                ampStreaming: (settings.ampEnabled ?? true) && (ch.ampEnabled ?? true),
               }
             : ch
         )
@@ -281,6 +290,7 @@ export default function Home() {
                     rxKbps: codec === "Opus" ? 64 : 80,
                     txKbps: 0,
                     pttActive: false,
+                    ampStreaming: (settings.ampEnabled ?? true) && (ch.ampEnabled ?? true),
                   }
                 : ch
             );
@@ -311,6 +321,7 @@ export default function Home() {
               rxKbps: 0,
               txKbps: 0,
               pttActive: false,
+              ampStreaming: false,
             }
           : ch
       );
@@ -420,6 +431,7 @@ export default function Home() {
                 sipPort: cfg.sipPort || prev.sipPort,
                 selectedDevice: cfg.selectedDevice || prev.selectedDevice,
                 localIp: cfg.localIp || prev.localIp,
+                ampEnabled: cfg.ampEnabled !== undefined ? cfg.ampEnabled : prev.ampEnabled,
               }));
             } else if (payload.type === "audio_level") {
               const { id, level } = payload.data;

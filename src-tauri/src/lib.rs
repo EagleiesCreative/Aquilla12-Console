@@ -60,6 +60,21 @@ struct ChannelConfig {
     srtp_enabled: bool,
     #[serde(rename = "sipAuthRequired")]
     sip_auth_required: bool,
+    // A-MP (Aquilla Mirror Protocol) — per-channel recorder mirror destination
+    #[serde(rename = "ampIp", default = "default_amp_ip")]
+    amp_ip: String,
+    #[serde(rename = "ampPort", default)]
+    amp_port: u16,
+    #[serde(rename = "ampEnabled", default = "default_true")]
+    amp_enabled: bool,
+}
+
+fn default_amp_ip() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +84,9 @@ struct GatewayConfig {
     #[serde(rename = "selectedDevice")]
     selected_device: Option<String>,
     channels: Vec<ChannelConfig>,
+    // A-MP global master enable
+    #[serde(rename = "ampEnabled", default = "default_true")]
+    amp_enabled: bool,
 }
 
 /// Get the path to the SQLite database in the OS app data directory.
@@ -109,6 +127,21 @@ fn init_db(conn: &Connection) {
     let _ = conn.execute("ALTER TABLE channels ADD COLUMN volume INTEGER NOT NULL DEFAULT 100", []);
     let _ = conn.execute("ALTER TABLE channels ADD COLUMN srtp_enabled INTEGER NOT NULL DEFAULT 1", []);
     let _ = conn.execute("ALTER TABLE channels ADD COLUMN sip_auth_required INTEGER NOT NULL DEFAULT 1", []);
+
+    // A-MP (Aquilla Mirror Protocol) columns for per-channel recorder mirroring.
+    let _ = conn.execute("ALTER TABLE channels ADD COLUMN amp_ip TEXT NOT NULL DEFAULT '127.0.0.1'", []);
+    // Seed default per-channel ports (5004, 5006, 5008 ...) ONLY on first add of the
+    // column — so a user who later sets a port to 0 (to disable a channel's mirror)
+    // isn't reset back to a default on the next startup.
+    let amp_port_added = conn
+        .execute("ALTER TABLE channels ADD COLUMN amp_port INTEGER NOT NULL DEFAULT 0", [])
+        .is_ok();
+    if amp_port_added {
+        let _ = conn.execute("UPDATE channels SET amp_port = 5004 + (id - 1) * 2 WHERE amp_port = 0", []);
+    }
+    // Global A-MP master enable (default on).
+    let _ = conn.execute("ALTER TABLE channels ADD COLUMN amp_enabled INTEGER NOT NULL DEFAULT 1", []);
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('amp_enabled', 'true')", []).ok();
 
     // Ensure we have a default/auto-generated API key, SIP auth credentials, and admin login password
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sip_auth_password', 'securepass123')", []).ok();
@@ -155,12 +188,19 @@ fn load_config() -> GatewayConfig {
             Ok(if v.is_empty() { None } else { Some(v) })
         })
         .unwrap_or(None);
-    
+
+    let amp_enabled: bool = conn
+        .query_row("SELECT value FROM settings WHERE key = 'amp_enabled'", [], |row| {
+            let v: String = row.get(0)?;
+            Ok(v != "false" && v != "0")
+        })
+        .unwrap_or(true);
+
     // Load channels (still read is_conference column for backward compat but ignore it)
     let mut stmt = conn.prepare(
-        "SELECT id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required FROM channels ORDER BY id"
+        "SELECT id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled FROM channels ORDER BY id"
     ).unwrap();
-    
+
     let channels: Vec<ChannelConfig> = stmt.query_map([], |row| {
         Ok(ChannelConfig {
             id: row.get::<_, u32>(0)?,
@@ -175,20 +215,24 @@ fn load_config() -> GatewayConfig {
             volume: row.get::<_, u32>(9)?,
             srtp_enabled: row.get::<_, i32>(10)? != 0,
             sip_auth_required: row.get::<_, i32>(11)? != 0,
+            amp_ip: row.get::<_, String>(12).unwrap_or_else(|_| default_amp_ip()),
+            amp_port: row.get::<_, u32>(13).unwrap_or(0) as u16,
+            amp_enabled: row.get::<_, i32>(14).unwrap_or(1) != 0,
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
-    
+
     if channels.is_empty() {
         // First run — seed defaults and save
         let config = default_config();
         save_config(&config);
         return config;
     }
-    
+
     GatewayConfig {
         sip_port,
         selected_device,
         channels,
+        amp_enabled,
     }
 }
 
@@ -213,13 +257,18 @@ fn save_config(config: &GatewayConfig) {
         "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_device', ?1)",
         [config.selected_device.clone().unwrap_or_default()],
     ).ok();
-    
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('amp_enabled', ?1)",
+        [if config.amp_enabled { "true" } else { "false" }],
+    ).ok();
+
     // Save channels in a transaction
     conn.execute("BEGIN", []).ok();
     for ch in &config.channels {
         conn.execute(
-            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11)",
+            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 ch.id,
                 ch.label,
@@ -232,6 +281,9 @@ fn save_config(config: &GatewayConfig) {
                 ch.volume,
                 ch.srtp_enabled as i32,
                 ch.sip_auth_required as i32,
+                ch.amp_ip,
+                ch.amp_port as u32,
+                ch.amp_enabled as i32,
             ],
         ).ok();
     }
@@ -280,16 +332,22 @@ fn save_config_to_conn(conn: &Connection, config: &GatewayConfig) {
         "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_device', ?1)",
         [config.selected_device.clone().unwrap_or_default()],
     ).ok();
-    
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('amp_enabled', ?1)",
+        [if config.amp_enabled { "true" } else { "false" }],
+    ).ok();
+
     for ch in &config.channels {
         conn.execute(
-            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11)",
+            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 ch.id, ch.label, ch.protocol, ch.target_ip,
                 ch.target_port as u32, ch.sip_user, ch.codec,
                 ch.local_port.map(|v| v as u32),
                 ch.volume, ch.srtp_enabled as i32, ch.sip_auth_required as i32,
+                ch.amp_ip, ch.amp_port as u32, ch.amp_enabled as i32,
             ],
         ).ok();
     }
@@ -309,13 +367,17 @@ fn default_config() -> GatewayConfig {
             volume: 100,
             srtp_enabled: true,
             sip_auth_required: true,
+            amp_ip: "127.0.0.1".to_string(),
+            amp_port: 5004 + (id as u16 - 1) * 2,
+            amp_enabled: true,
         })
         .collect();
-    
+
     GatewayConfig {
         sip_port: 5060,
         selected_device: None,
         channels,
+        amp_enabled: true,
     }
 }
 
@@ -355,6 +417,14 @@ struct Channel {
     srtp_enabled: bool,
     #[serde(rename = "sipAuthRequired")]
     sip_auth_required: bool,
+    #[serde(rename = "ampIp")]
+    amp_ip: String,
+    #[serde(rename = "ampPort")]
+    amp_port: u16,
+    #[serde(rename = "ampStreaming")]
+    amp_streaming: bool,
+    #[serde(rename = "ampEnabled")]
+    amp_enabled: bool,
     #[serde(skip)]
     secure_context: Arc<tokio::sync::Mutex<crypto::SecureChannelContext>>,
     #[serde(skip)]
@@ -411,6 +481,7 @@ struct AppState {
     active_calls: Vec<ActiveCall>,
     selected_device: Option<String>,
     sip_port: u16,
+    amp_enabled: bool,
 }
 
 fn save_state_to_file(state: &AppState) {
@@ -426,14 +497,18 @@ fn save_state_to_file(state: &AppState) {
         volume: ch.volume,
         srtp_enabled: ch.srtp_enabled,
         sip_auth_required: ch.sip_auth_required,
+        amp_ip: ch.amp_ip.clone(),
+        amp_port: ch.amp_port,
+        amp_enabled: ch.amp_enabled,
     }).collect();
 
     let config = GatewayConfig {
         sip_port: state.sip_port,
         selected_device: state.selected_device.clone(),
         channels: channel_configs,
+        amp_enabled: state.amp_enabled,
     };
-    
+
     save_config(&config);
 }
 
@@ -1037,6 +1112,97 @@ fn rand_u64() -> u64 {
     nanos as u64
 }
 
+// ============================================================================
+// A-MP (Aquilla Mirror Protocol) — NP-C4I Recorder integration
+//
+// Aquilla always transmits/receives G.711 µ-law (PCMU) on the wire. The NP-C4I
+// Recorder ingests standard RTP/PCMU on UDP ports (one per channel). To record
+// a peer-to-peer call we "tap" both directions and mirror a clean copy of the
+// µ-law audio to the recorder as a single, coherent RTP/PCMU stream.
+//
+//   TX (local mic, only while PTT is active) ─┐
+//                                             ├─►  RecordingTap  ─► recorder UDP port
+//   RX (remote peer audio, when PTT idle)  ───┘
+//
+// Both directions share one SSRC + sequence + timestamp space so the recorder
+// sees one well-formed stream and records the whole conversation into one file.
+// Destination IP/port are configured per channel (amp_ip / amp_port) and gated
+// by the global amp_enabled flag, all held in AppState (editable via Web Config).
+// ============================================================================
+
+/// A per-call sink that re-packetizes µ-law audio into RTP/PCMU for the recorder.
+struct RecordingTap {
+    socket: Arc<tokio::net::UdpSocket>,
+    dest: String,
+    ssrc: u32,
+    seq: std::sync::atomic::AtomicU16,
+    ts: std::sync::atomic::AtomicU32,
+}
+
+impl RecordingTap {
+    /// Wrap a µ-law payload in a standard RTP header (V2, PT=0 PCMU) and send it
+    /// to the recorder. TX and RX both call this, sharing one seq/ts/ssrc space.
+    async fn send_ulaw(&self, ulaw: &[u8]) {
+        use std::sync::atomic::Ordering;
+        if ulaw.is_empty() {
+            return;
+        }
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let ts = self.ts.fetch_add(ulaw.len() as u32, Ordering::Relaxed);
+
+        let mut packet = Vec::with_capacity(12 + ulaw.len());
+        packet.push(0x80); // Version 2, no padding/extension/CSRC
+        packet.push(0x00); // Marker 0, Payload Type 0 (PCMU)
+        packet.push((seq >> 8) as u8);
+        packet.push((seq & 0xFF) as u8);
+        packet.extend_from_slice(&ts.to_be_bytes());
+        packet.extend_from_slice(&self.ssrc.to_be_bytes());
+        packet.extend_from_slice(ulaw);
+
+        let _ = self.socket.send_to(&packet, &self.dest).await;
+    }
+}
+
+/// Build a recording tap from already-resolved A-MP settings. Takes plain params
+/// (never locks AppState) so it is safe to call from a site that already holds
+/// the state lock — avoiding tokio Mutex re-entrancy deadlocks. Returns None if
+/// A-MP is disabled, the port is unset, or the mirror socket can't be created.
+async fn build_recording_tap(enabled: bool, ip: &str, port: u16, channel_id: u32) -> Option<Arc<RecordingTap>> {
+    if !enabled || port == 0 || ip.trim().is_empty() {
+        return None;
+    }
+    match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(sock) => {
+            let dest = format!("{}:{}", ip, port);
+            println!("[A-MP] Channel {} mirroring call audio to {}", channel_id, dest);
+            Some(Arc::new(RecordingTap {
+                socket: Arc::new(sock),
+                dest,
+                ssrc: rand_u32(),
+                seq: std::sync::atomic::AtomicU16::new(rand_u32() as u16),
+                ts: std::sync::atomic::AtomicU32::new(rand_u32()),
+            }))
+        }
+        Err(e) => {
+            eprintln!("[A-MP] Failed to open mirror socket for channel {}: {}", channel_id, e);
+            None
+        }
+    }
+}
+
+/// Resolve (enabled, ip, port) for a channel from AppState without holding the
+/// lock across the socket bind. Convenience for call sites that do NOT already
+/// hold the state lock.
+async fn amp_settings_for(state: &Arc<Mutex<AppState>>, channel_id: u32) -> (bool, String, u16) {
+    let lock = state.lock().await;
+    let ch = lock.channels.iter().find(|c| c.id == channel_id);
+    (
+        lock.amp_enabled && ch.map(|c| c.amp_enabled).unwrap_or(false),
+        ch.map(|c| c.amp_ip.clone()).unwrap_or_else(|| "127.0.0.1".to_string()),
+        ch.map(|c| c.amp_port).unwrap_or(0),
+    )
+}
+
 // Background RTP streaming from local microphone
 fn start_microphone_rtp(
     channel_id: u32,
@@ -1046,6 +1212,7 @@ fn start_microphone_rtp(
     device_name: Option<String>,
     ptt_active: Arc<std::sync::atomic::AtomicBool>,
     call_id: String,
+    rec_tap: Option<Arc<RecordingTap>>,
 ) -> (Arc<std::sync::atomic::AtomicBool>, tokio::task::AbortHandle) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1187,6 +1354,13 @@ fn start_microphone_rtp(
                             }
                         } else {
                             let _ = rtp_socket_clone.send_to(&packet, &rtp_dest_clone).await;
+                        }
+
+                        // Mirror the outgoing (local/TX) audio to the NP-C4I Recorder.
+                        // Always send the clean, unencrypted µ-law payload so the
+                        // recorder gets plain RTP/PCMU regardless of SRTP.
+                        if let Some(ref tap) = rec_tap {
+                            tap.send_ulaw(&packet[12..]).await;
                         }
                     }
                     
@@ -1372,6 +1546,8 @@ fn start_audio_playback(
     srtp_enabled: bool,
     secure_context: Arc<tokio::sync::Mutex<crypto::SecureChannelContext>>,
     call_id: String,
+    rec_tap: Option<Arc<RecordingTap>>,
+    ptt_active: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::AbortHandle {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -1566,6 +1742,18 @@ fn start_audio_playback(
                             }
 
                             if let Some(payload) = raw_payload {
+                                // Mirror the incoming (remote/RX) audio to the recorder
+                                // as clean RTP/PCMU (µ-law, post-decrypt). Skip while PTT
+                                // is active: TX is being mirrored on the same shared stream,
+                                // and interleaving both directions into one port causes
+                                // stutter/distortion. PTT comms are half-duplex, so during
+                                // transmit the local operator isn't listening anyway.
+                                if let Some(ref tap) = rec_tap {
+                                    if !ptt_active.load(std::sync::atomic::Ordering::SeqCst) {
+                                        tap.send_ulaw(&payload).await;
+                                    }
+                                }
+
                                 // Decode µ-law to linear i16
                                 let mut pcm: Vec<i16> = payload.iter().map(|&b| ulaw_to_linear(b)).collect();
                                 
@@ -1700,15 +1888,34 @@ async fn accept_call_handler(
 
         let ptt_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // Build the A-MP recorder tap (shared by TX + RX for this call).
+        // Read settings from the already-held lock to avoid re-locking (deadlock).
+        let (amp_en, amp_ip, amp_port) = {
+            let ch_ref = lock.channels.iter().find(|c| c.id == id);
+            (lock.amp_enabled && ch_ref.map(|c| c.amp_enabled).unwrap_or(false),
+             ch_ref.map(|c| c.amp_ip.clone()).unwrap_or_else(|| "127.0.0.1".to_string()),
+             ch_ref.map(|c| c.amp_port).unwrap_or(0))
+        };
+        let rec_tap = build_recording_tap(amp_en, &amp_ip, amp_port, id).await;
+        if rec_tap.is_some() {
+            let upd = {
+                if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
+                    ch.amp_streaming = true;
+                    Some(serde_json::json!({ "type": "channel_update", "data": ch }).to_string())
+                } else { None }
+            };
+            if let Some(upd) = upd { let _ = lock.tx.send(upd); }
+        }
+
         // Start capture/transmit task
         let dest_rtp = format!("{}:{}", ctx.remote_ip, ctx.remote_rtp_port);
         let (stop_flag, rtp_abort) = start_microphone_rtp(
-            id, Arc::clone(&rtp_socket), dest_rtp, Arc::clone(&state), selected_device, Arc::clone(&ptt_flag), ctx.call_id.clone()
+            id, Arc::clone(&rtp_socket), dest_rtp, Arc::clone(&state), selected_device, Arc::clone(&ptt_flag), ctx.call_id.clone(), rec_tap.clone()
         );
 
         // Start playback task
         let stop_flag_playback = Arc::clone(&stop_flag);
-        let rtp_rx_abort = start_audio_playback(id, Arc::clone(&rtp_socket), Arc::clone(&state), stop_flag_playback, ch_srtp, ch_ctx, ctx.call_id.clone());
+        let rtp_rx_abort = start_audio_playback(id, Arc::clone(&rtp_socket), Arc::clone(&state), stop_flag_playback, ch_srtp, ch_ctx, ctx.call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_flag));
 
         // Bind local SIP socket synchronously so we can keep it alive for the session
         let sip_socket = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap());
@@ -1808,6 +2015,7 @@ async fn accept_call_handler(
                                 ch_bye.ptt_active = false;
                                 ch_bye.tx_kbps = 0;
                                 ch_bye.audio_level = 0;
+                                ch_bye.amp_streaming = false;
                             }
                             let _ = tx_cb_listen.send(serde_json::json!({
                                 "type": "channel_update",
@@ -1816,7 +2024,8 @@ async fn accept_call_handler(
                                     "status": "IDLE",
                                     "pttActive": false,
                                     "txKbps": 0,
-                                    "audioLevel": 0
+                                    "audioLevel": 0,
+                                    "ampStreaming": false
                                 }
                             }).to_string());
                             break;
@@ -1877,10 +2086,11 @@ async fn reject_call_handler(
 
     if let Some(ctx) = ch.incoming_call.take() {
         ch.status = "IDLE".to_string();
-        
+        ch.amp_streaming = false;
+
         let ch_clone = ch.clone();
         let tx = lock.tx.clone();
-        
+
         // Broadcast UI update
         let state_msg = serde_json::json!({
             "type": "channel_update",
@@ -2085,13 +2295,30 @@ async fn initiate_call_handler(
         let ptt_active_flag_clone = Arc::clone(&ptt_active_flag);
 
         let call_id = format!("rtp-{}", id);
+        // A-MP tap — read settings from the held lock (no re-lock / deadlock).
+        let (amp_en, amp_ip, amp_port) = {
+            let ch_ref = lock.channels.iter().find(|c| c.id == id);
+            (lock.amp_enabled && ch_ref.map(|c| c.amp_enabled).unwrap_or(false),
+             ch_ref.map(|c| c.amp_ip.clone()).unwrap_or_else(|| "127.0.0.1".to_string()),
+             ch_ref.map(|c| c.amp_port).unwrap_or(0))
+        };
+        let rec_tap = build_recording_tap(amp_en, &amp_ip, amp_port, id).await;
+        if rec_tap.is_some() {
+            let upd = {
+                if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
+                    ch.amp_streaming = true;
+                    Some(serde_json::json!({ "type": "channel_update", "data": ch }).to_string())
+                } else { None }
+            };
+            if let Some(upd) = upd { let _ = lock.tx.send(upd); }
+        }
         let (audio_flag, rtp_task) = start_microphone_rtp(
-            id, Arc::clone(&rtp_sock_task), rtp_dest, Arc::clone(&state_audio), selected_device, ptt_active_flag, call_id.clone()
+            id, Arc::clone(&rtp_sock_task), rtp_dest, Arc::clone(&state_audio), selected_device, ptt_active_flag, call_id.clone(), rec_tap.clone()
         );
 
         let audio_flag_playback = Arc::clone(&audio_flag);
         let rtp_rx_task = start_audio_playback(
-            id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone()
+            id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_active_flag_clone)
         );
 
         let active_call = ActiveCall {
@@ -2312,6 +2539,7 @@ async fn initiate_call_handler(
                                 ch_fail.status = "FAILED".to_string();
                                 ch_fail.ptt_active = false;
                                 ch_fail.tx_kbps = 0;
+                                ch_fail.amp_streaming = false;
                             }
                             let _ = tx_cb.send(serde_json::json!({
                                 "type": "channel_update",
@@ -2319,7 +2547,8 @@ async fn initiate_call_handler(
                                     "id": id,
                                     "status": "FAILED",
                                     "pttActive": false,
-                                    "txKbps": 0
+                                    "txKbps": 0,
+                                    "ampStreaming": false
                                 }
                             }).to_string());
                             break;
@@ -2438,13 +2667,15 @@ async fn initiate_call_handler(
                                  let lock_ac = state_audio.lock().await;
                                  lock_ac.active_calls.iter().find(|c| c.channel_id == id).map(|c| c.call_id.clone()).unwrap_or_else(|| format!("sip-{}", id))
                              };
+                             let (amp_en, amp_ip, amp_port) = amp_settings_for(&state_audio, id).await;
+                             let rec_tap = build_recording_tap(amp_en, &amp_ip, amp_port, id).await;
                              let (audio_flag, rtp_task) = start_microphone_rtp(
-                                 id, Arc::clone(&rtp_sock_task), rtp_dest, Arc::clone(&state_audio), selected_device.clone(), ptt_active_flag, call_id.clone()
+                                 id, Arc::clone(&rtp_sock_task), rtp_dest, Arc::clone(&state_audio), selected_device.clone(), ptt_active_flag, call_id.clone(), rec_tap.clone()
                              );
 
                              let audio_flag_playback = Arc::clone(&audio_flag);
                              let rtp_rx_task = start_audio_playback(
-                                 id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone()
+                                 id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_active_flag_clone)
                              );
 
                             let mut lock_rtp = state_clone.lock().await;
@@ -2453,6 +2684,17 @@ async fn initiate_call_handler(
                                 ac.ptt_active = Some(ptt_active_flag_clone);
                                 ac.rtp_abort_handle = Some(rtp_task);
                                 ac.rtp_rx_abort_handle = Some(rtp_rx_task);
+                            }
+                            if rec_tap.is_some() {
+                                let upd = {
+                                    if let Some(ch) = lock_rtp.channels.iter_mut().find(|c| c.id == id) {
+                                        ch.amp_streaming = true;
+                                        Some(serde_json::json!({ "type": "channel_update", "data": ch }).to_string())
+                                    } else { None }
+                                };
+                                if let Some(upd) = upd {
+                                    let _ = lock_rtp.tx.send(upd);
+                                }
                             }
                         } else if msg.contains("BYE") {
                             let _ = tx_cb.send(serde_json::json!({
@@ -2481,6 +2723,7 @@ async fn initiate_call_handler(
                                 ch_bye.status = "IDLE".to_string();
                                 ch_bye.ptt_active = false;
                                 ch_bye.tx_kbps = 0;
+                                ch_bye.amp_streaming = false;
                             }
                             let _ = tx_cb.send(serde_json::json!({
                                 "type": "channel_update",
@@ -2488,7 +2731,8 @@ async fn initiate_call_handler(
                                     "id": id,
                                     "status": "IDLE",
                                     "pttActive": false,
-                                    "txKbps": 0
+                                    "txKbps": 0,
+                                    "ampStreaming": false
                                 }
                             }).to_string());
                             break;
@@ -2585,6 +2829,7 @@ async fn hangup_handler(
         ch.audio_level = 0;
         ch.duration = 0;
         ch.ptt_active = false;
+        ch.amp_streaming = false;
 
         println!("[Rust Engine] [CH {}] Call/Session terminated.", id);
 
@@ -2600,7 +2845,8 @@ async fn hangup_handler(
                 "packetLoss": 0.0,
                 "rxKbps": 0,
                 "txKbps": 0,
-                "pttActive": false
+                "pttActive": false,
+                "ampStreaming": false
             }
         }).to_string());
 
@@ -2817,6 +3063,10 @@ pub fn run() {
             volume: ch_cfg.volume,
             srtp_enabled: ch_cfg.srtp_enabled,
             sip_auth_required: ch_cfg.sip_auth_required,
+            amp_ip: if ch_cfg.amp_ip.is_empty() { "127.0.0.1".to_string() } else { ch_cfg.amp_ip.clone() },
+            amp_port: if ch_cfg.amp_port == 0 { 5004 + (ch_cfg.id as u16 - 1) * 2 } else { ch_cfg.amp_port },
+            amp_streaming: false,
+            amp_enabled: ch_cfg.amp_enabled,
             secure_context: Arc::new(tokio::sync::Mutex::new(crypto::SecureChannelContext::new())),
             incoming_call: None,
         }
@@ -2828,6 +3078,7 @@ pub fn run() {
         active_calls: Vec::new(),
         selected_device: config.selected_device,
         sip_port: config.sip_port,
+        amp_enabled: config.amp_enabled,
     }));
     let state_for_server = Arc::clone(&state);
 
@@ -3170,6 +3421,7 @@ pub fn run() {
                                                     if incoming.call_id == call_id {
                                                         matched_channel_id = Some(ch.id);
                                                         ch.status = "IDLE".to_string();
+                                                        ch.amp_streaming = false;
                                                         ch.incoming_call = None;
                                                         break;
                                                     }
@@ -3198,6 +3450,7 @@ pub fn run() {
                                                         ch.ptt_active = false;
                                                         ch.tx_kbps = 0;
                                                         ch.audio_level = 0;
+                                                        ch.amp_streaming = false;
                                                     }
                                                 }
                                             }
@@ -3224,7 +3477,8 @@ pub fn run() {
                                                         "status": "IDLE",
                                                         "pttActive": false,
                                                         "txKbps": 0,
-                                                        "audioLevel": 0
+                                                        "audioLevel": 0,
+                                                        "ampStreaming": false
                                                     }
                                                 }).to_string();
                                                 let _ = tx_chan.send(update_msg);
@@ -3535,6 +3789,54 @@ async fn show_config_handler(
         ));
     }
 
+    // Build A-MP (Aquilla Mirror Protocol) per-channel destination rows.
+    let mut amp_rows = String::new();
+    for ch in &lock.channels {
+        let (dot_class, stream_text) = if ch.amp_streaming {
+            ("amp-dot amp-dot-live", "STREAMING")
+        } else {
+            ("amp-dot", "IDLE")
+        };
+        let is_routing_or_dialing = ch.status == "CONNECTED" || ch.status == "RINGING" || ch.status == "INCOMING";
+        let disabled_attr = if is_routing_or_dialing { "disabled" } else { "" };
+        let amp_enabled_checked = if ch.amp_enabled { "checked" } else { "" };
+
+        amp_rows.push_str(&format!(
+            r#"
+            <tr>
+                <td style="font-weight: bold; text-align: center;">{:02}</td>
+                <td style="color:#4b5563;">{}</td>
+                <td style="text-align: center;">
+                    <input type="checkbox" name="amp_channel_enabled_{}" {} {} style="width: 18px; height: 18px; cursor: pointer;" />
+                </td>
+                <td>
+                    <input type="text" name="amp_ip_{}" value="{}" {} style="width: 150px;" placeholder="127.0.0.1" />
+                </td>
+                <td>
+                    <input type="number" name="amp_port_{}" value="{}" {} style="width: 100px;" min="0" max="65535" />
+                </td>
+                <td style="text-align:center;">
+                    <span class="{}"></span><span style="font-size:11px; font-weight:600; color:#4b5563;">{}</span>
+                </td>
+            </tr>
+            "#,
+            ch.id,
+            html_escape(&ch.label),
+            ch.id,
+            amp_enabled_checked,
+            disabled_attr,
+            ch.id,
+            html_escape(&ch.amp_ip),
+            disabled_attr,
+            ch.id,
+            ch.amp_port,
+            disabled_attr,
+            dot_class,
+            stream_text,
+        ));
+    }
+    let amp_enabled_checked = if lock.amp_enabled { "checked" } else { "" };
+
     let success_banner = if saved {
         r#"<div class="alert-success">Configuration saved successfully and synced to console panel.</div>"#
     } else {
@@ -3709,6 +4011,61 @@ async fn show_config_handler(
                 .refresh-link:hover {{
                     text-decoration: underline;
                 }}
+                .tabs {{
+                    display: flex;
+                    gap: 4px;
+                    border-bottom: 2px solid #e5e7eb;
+                    margin-bottom: 20px;
+                }}
+                .tab-btn {{
+                    background: transparent;
+                    border: none;
+                    border-bottom: 2px solid transparent;
+                    margin-bottom: -2px;
+                    padding: 10px 18px;
+                    font-family: inherit;
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: #6b7280;
+                    cursor: pointer;
+                }}
+                .tab-btn:hover {{ color: #111827; }}
+                .tab-btn.active {{
+                    color: #2563eb;
+                    border-bottom-color: #2563eb;
+                }}
+                .tab-panel {{ display: none; }}
+                .tab-panel.active {{ display: block; }}
+                .amp-toggle-row {{
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    padding: 12px 16px;
+                    background: #f9fafb;
+                    border: 1px solid #e5e7eb;
+                    border-radius: 4px;
+                    margin-bottom: 16px;
+                }}
+                .amp-toggle-row input {{ width: 18px; height: 18px; cursor: pointer; }}
+                .amp-toggle-row label {{ font-size: 13px; color: #111827; font-weight: 600; }}
+                .amp-dot {{
+                    display: inline-block;
+                    width: 8px; height: 8px;
+                    border-radius: 50%;
+                    background: #d1d5db;
+                    margin-right: 6px;
+                    vertical-align: middle;
+                }}
+                .amp-dot-live {{
+                    background: #ef4444;
+                    box-shadow: 0 0 0 0 rgba(239,68,68,0.7);
+                    animation: amp-pulse 1.4s infinite;
+                }}
+                @keyframes amp-pulse {{
+                    0%   {{ box-shadow: 0 0 0 0 rgba(239,68,68,0.6); }}
+                    70%  {{ box-shadow: 0 0 0 6px rgba(239,68,68,0); }}
+                    100% {{ box-shadow: 0 0 0 0 rgba(239,68,68,0); }}
+                }}
             </style>
         </head>
         <body>
@@ -3722,7 +4079,13 @@ async fn show_config_handler(
 
                 {}
 
+                <div class="tabs">
+                    <button type="button" class="tab-btn active" data-tab="tab-channels" onclick="switchTab('tab-channels', this)">Channel Mapping</button>
+                    <button type="button" class="tab-btn" data-tab="tab-amp" onclick="switchTab('tab-amp', this)">A-MP Stream Mapping</button>
+                </div>
+
                 <form method="POST" action="/config/save">
+                  <div id="tab-channels" class="tab-panel active">
                     <div class="section">
                         <h2>General Interface Configuration</h2>
                         <div class="grid-settings">
@@ -3766,6 +4129,35 @@ async fn show_config_handler(
                             * Note: Channel parameters (Alias, Destination, Codec) cannot be modified while the respective channel is active (Routing or Dialing).
                         </div>
                     </div>
+                  </div>
+
+                  <div id="tab-amp" class="tab-panel">
+                    <div class="section">
+                        <h2>A-MP Stream Mapping (NP-C4I Recorder)</h2>
+                        <div class="amp-toggle-row">
+                            <input type="checkbox" id="amp_enabled" name="amp_enabled" {} />
+                            <label for="amp_enabled">Enable A-MP call mirroring to the NP-C4I Recorder (global master switch)</label>
+                        </div>
+                        <div class="info-note" style="margin-top:0; margin-bottom:8px;">
+                            Each active call is mirrored to the recorder as clean RTP/PCMU. Set the destination IP and UDP port per channel to match the recorder's listening ports (defaults: CH01&rarr;5004, CH02&rarr;5006, CH03&rarr;5008, CH04&rarr;5010). Set port to 0 to disable a channel.
+                        </div>
+                        <table class="channels-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 6%; text-align: center;">Slot</th>
+                                    <th style="width: 22%;">Channel Alias</th>
+                                    <th style="width: 10%; text-align: center;">Enable</th>
+                                    <th style="width: 26%;">Recorder Destination IP</th>
+                                    <th style="width: 20%;">Recorder UDP Port</th>
+                                    <th style="width: 16%; text-align:center;">Mirror State</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {}
+                            </tbody>
+                        </table>
+                    </div>
+                  </div>
 
                     <div style="text-align: right;">
                         <button type="submit" class="btn-submit">Apply Configuration</button>
@@ -3773,6 +4165,13 @@ async fn show_config_handler(
                 </form>
             </div>
             <script>
+            function switchTab(tabId, btn) {{
+                document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+                document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+                const panel = document.getElementById(tabId);
+                if (panel) panel.classList.add("active");
+                if (btn) btn.classList.add("active");
+            }}
             function updateSipUserState(id) {{
                 const protoSelect = document.getElementsByName("protocol_" + id)[0];
                 const sipUserInput = document.getElementsByName("sip_user_" + id)[0];
@@ -3812,7 +4211,9 @@ async fn show_config_handler(
         success_banner,
         lock.sip_port,
         devices_options,
-        channels_rows
+        channels_rows,
+        amp_enabled_checked,
+        amp_rows
     );
 
     Html(html_content)
@@ -3838,6 +4239,9 @@ async fn save_config_handler(
             lock.selected_device = Some(device.clone());
         }
     }
+
+    // A-MP global master switch (checkbox present only when ticked)
+    lock.amp_enabled = form_data.contains_key("amp_enabled");
 
     // Parse channel settings
     for id in 1..=12 {
@@ -3871,6 +4275,7 @@ async fn save_config_handler(
 
                 ch.srtp_enabled = form_data.contains_key(&format!("srtp_enabled_{}", id));
                 ch.sip_auth_required = form_data.contains_key(&format!("sip_auth_required_{}", id));
+                ch.amp_enabled = form_data.contains_key(&format!("amp_channel_enabled_{}", id));
 
                 // Recompute computed target_uri for frontend / telemetry
                 ch.target_uri = if ch.protocol == "RTP" {
@@ -3892,6 +4297,17 @@ async fn save_config_handler(
                 }
             }
 
+            // A-MP per-channel recorder destination — editable regardless of call
+            // state (only affects the NEXT call's mirror, not the live audio path).
+            if let Some(ip) = form_data.get(&format!("amp_ip_{}", id)) {
+                ch.amp_ip = if ip.trim().is_empty() { "127.0.0.1".to_string() } else { ip.trim().to_string() };
+            }
+            if let Some(port_str) = form_data.get(&format!("amp_port_{}", id)) {
+                if let Ok(p) = port_str.parse::<u16>() {
+                    ch.amp_port = p;
+                }
+            }
+
             // Broadcast the channel update to all connected frontend clients
             let update_msg = serde_json::json!({
                 "type": "channel_update",
@@ -3907,10 +4323,26 @@ async fn save_config_handler(
         "data": {
             "sipPort": lock.sip_port.to_string(),
             "selectedDevice": lock.selected_device.clone().unwrap_or_default(),
-            "localIp": get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string())
+            "localIp": get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
+            "ampEnabled": lock.amp_enabled
         }
     }).to_string();
     let _ = lock.tx.send(config_msg);
+
+    // Update A-MP streaming status dynamically based on current configuration
+    let amp_enabled = lock.amp_enabled;
+    let tx = lock.tx.clone();
+    for ch in lock.channels.iter_mut() {
+        let was_streaming = ch.amp_streaming;
+        ch.amp_streaming = amp_enabled && ch.amp_enabled && ch.status == "CONNECTED";
+        if was_streaming != ch.amp_streaming {
+            let update_msg = serde_json::json!({
+                "type": "channel_update",
+                "data": ch
+            }).to_string();
+            let _ = tx.send(update_msg);
+        }
+    }
 
     // Persist configuration to disk
     save_state_to_file(&lock);
@@ -3935,7 +4367,8 @@ async fn get_config_handler(
         Json(serde_json::json!({
             "sipPort": lock.sip_port.to_string(),
             "selectedDevice": lock.selected_device.clone().unwrap_or_default(),
-            "localIp": get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string())
+            "localIp": get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
+            "ampEnabled": lock.amp_enabled
         })),
     )
 }

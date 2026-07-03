@@ -33,6 +33,7 @@ export function ChannelCard({
     pttActive = false,
     volume = 100,
     srtpEnabled = true,
+    ampStreaming = false,
   } = channel;
 
   const lastTapRef = useRef<number>(0);
@@ -192,6 +193,15 @@ export function ChannelCard({
     >
       {/* Top Section: Label and Protocol Type */}
       <div className="flex flex-col items-center gap-1 shrink-0 relative w-full">
+        {/* A-MP Recording Mirror Indicator */}
+        {ampStreaming && (
+          <div className="absolute left-0 top-0.5 flex items-center justify-center" title="A-MP Mirror Stream Active (recording to NP-C4I)">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500"></span>
+            </span>
+          </div>
+        )}
         {/* Security Indicator */}
         <div className="absolute right-0 top-0" title={srtpEnabled ? "Secure SRTP" : "Plaintext RTP"}>
           {srtpEnabled ? (
@@ -200,7 +210,7 @@ export function ChannelCard({
             <Unlock className="h-3.5 w-3.5 text-rose-500 animate-pulse" />
           )}
         </div>
-        <span className="text-lg font-black text-gray-900 tracking-tight leading-none">
+        <span className="text-lg font-black text-gray-900 tracking-tight leading-none truncate block w-full px-5" title={label}>
           {label}
         </span>
         <span className={`text-[9px] uppercase px-1.5 py-[2px] leading-none border rounded select-none font-extrabold tracking-wider ${
