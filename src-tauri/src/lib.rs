@@ -1302,6 +1302,7 @@ fn start_microphone_rtp(
             // Standard point-to-point PTT logic
             let mut interval = tokio::time::interval(Duration::from_millis(20));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_tx_time = tokio::time::Instant::now();
             while let Some(audio_chunk) = rx_audio.recv().await {
                 resampler.process(&audio_chunk, &mut pcm_buffer);
                 
@@ -1362,6 +1363,24 @@ fn start_microphone_rtp(
                         if let Some(ref tap) = rec_tap {
                             tap.send_ulaw(&packet[12..]).await;
                         }
+                        
+                        last_tx_time = tokio::time::Instant::now();
+                    } else if last_tx_time.elapsed() >= Duration::from_secs(5) {
+                        // Send RTP keepalive (empty payload) to maintain Z2 connection
+                        if srtp_enabled {
+                            let ctx = secure_context.lock().await;
+                            if let Some(ref keys) = ctx.keys {
+                                let mut payload = vec![];
+                                if let Ok(tag) = crypto::encrypt_rtp_gcm(keys, sequence_number, timestamp, ssrc, &mut payload) {
+                                    let mut srtp_packet = packet[0..12].to_vec();
+                                    srtp_packet.extend_from_slice(&tag);
+                                    let _ = rtp_socket_clone.send_to(&srtp_packet, &rtp_dest_clone).await;
+                                }
+                            }
+                        } else {
+                            let _ = rtp_socket_clone.send_to(&packet[0..12], &rtp_dest_clone).await;
+                        }
+                        last_tx_time = tokio::time::Instant::now();
                     }
                     
                     sequence_number = sequence_number.wrapping_add(1);
@@ -3715,7 +3734,7 @@ async fn show_config_handler(
                     <span class="status-badge {}">{}</span>
                 </td>
                 <td>
-                    <input type="text" name="label_{}" value="{}" {} style="width: 100px;" required />
+                    <input type="text" name="label_{}" value="{}" {} style="width: 100px;" maxlength="7" required />
                 </td>
                 <td style="text-align: center;">
                     <input type="checkbox" name="srtp_enabled_{}" {} {} style="width: 20px; height: 20px; cursor: pointer;" />
@@ -4256,7 +4275,9 @@ async fn save_config_handler(
             // Only update channels that are IDLE or FAILED
             if ch.status == "IDLE" || ch.status == "FAILED" {
                 if let Some(label) = form_data.get(&label_key) {
-                    ch.label = label.clone();
+                    let mut truncated = label.trim().to_string();
+                    truncated.truncate(7);
+                    ch.label = truncated;
                 }
                 if let Some(protocol) = form_data.get(&protocol_key) {
                     ch.protocol = protocol.clone();

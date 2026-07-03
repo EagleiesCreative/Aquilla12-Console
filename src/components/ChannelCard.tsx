@@ -210,7 +210,7 @@ export function ChannelCard({
             <Unlock className="h-3.5 w-3.5 text-rose-500 animate-pulse" />
           )}
         </div>
-        <span className="text-lg font-black text-gray-900 tracking-tight leading-none truncate block w-full px-5" title={label}>
+        <span className="text-base font-black text-gray-900 tracking-tight leading-none truncate block w-full pl-3 pr-4" title={label}>
           {label}
         </span>
         <span className={`text-[9px] uppercase px-1.5 py-[2px] leading-none border rounded select-none font-extrabold tracking-wider ${
