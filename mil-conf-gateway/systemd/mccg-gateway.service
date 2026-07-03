@@ -1,0 +1,29 @@
+[Unit]
+Description=Military Conference Call Gateway (MCCG)
+Documentation=https://internal/mccg
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mccg
+Group=mccg
+WorkingDirectory=/opt/mccg
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/mccg/venv/bin/python -m gateway.main \
+    --config /etc/mccg \
+    --local-ip 0.0.0.0 \
+    --log-level INFO
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log/mccg
+
+[Install]
+WantedBy=multi-user.target

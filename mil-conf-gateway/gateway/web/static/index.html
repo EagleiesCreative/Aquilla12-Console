@@ -1,0 +1,892 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MCCG · Conference Gateway</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { theme: { extend: {
+    colors: {
+      ink:      { 900:'#0a0e14', 800:'#0f141c', 700:'#151c26', 600:'#1c2532' },
+      line:     { DEFAULT:'#22303f', bright:'#334357' },
+      accent:   { DEFAULT:'#5b9dff', dim:'#3b6db8' },
+      good:     '#3ed48f',
+      warn:     '#f6ad55',
+      bad:      '#f56565',
+      muted:    '#7a8697',
+    },
+    fontFamily: {
+      mono: ['ui-monospace','SF Mono','Menlo','Consolas','monospace'],
+    }
+  } } }
+</script>
+<style>
+  html, body { background:#0a0e14; color:#e2e8f0; font-family:-apple-system,'Segoe UI',Roboto,sans-serif; }
+  .mono { font-family: ui-monospace,'SF Mono',Menlo,Consolas,monospace; }
+  .card { background:#0f141c; border:1px solid #22303f; border-radius:12px; }
+  .card-hover:hover { border-color:#334357; }
+  .btn { padding:8px 14px; border-radius:8px; font-size:13px; font-weight:500; transition:all .12s; }
+  .btn-primary { background:#5b9dff; color:#0a0e14; }
+  .btn-primary:hover { background:#7ab0ff; }
+  .btn-ghost { background:transparent; border:1px solid #22303f; color:#cbd5e0; }
+  .btn-ghost:hover { border-color:#334357; background:#0f141c; }
+  .btn-danger { color:#f56565; background:transparent; }
+  .btn-danger:hover { background:rgba(245,101,101,.1); }
+  .field { background:#0a0e14; border:1px solid #22303f; color:#e2e8f0; border-radius:8px; padding:8px 12px; font-size:13px; width:100%; }
+  .field:focus { outline:none; border-color:#5b9dff; box-shadow:0 0 0 3px rgba(91,157,255,.15); }
+  .field-label { font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:#7a8697; margin-bottom:4px; font-weight:600; }
+  .pill { padding:2px 10px; border-radius:999px; font-size:11px; font-weight:600; display:inline-flex; align-items:center; gap:4px; }
+  .tab-btn { padding:12px 4px; font-size:14px; font-weight:500; color:#7a8697; border-bottom:2px solid transparent; transition:all .15s; }
+  .tab-btn:hover { color:#cbd5e0; }
+  .tab-btn.active { color:#5b9dff; border-color:#5b9dff; }
+  .copy-chip { cursor:pointer; padding:4px 10px; background:#0a0e14; border:1px solid #22303f; border-radius:6px; font-size:12px; transition:all .12s; display:inline-flex; align-items:center; gap:6px; }
+  .copy-chip:hover { border-color:#5b9dff; color:#5b9dff; }
+  .copy-chip.copied { border-color:#3ed48f; color:#3ed48f; }
+  .ptt-btn {
+    width:240px; height:240px; border-radius:50%; font-weight:800; font-size:22px; color:white;
+    background: radial-gradient(circle at 30% 30%, #e05252, #7a1e1e);
+    box-shadow: 0 8px 32px rgba(224,82,82,.35), inset 0 -8px 0 rgba(0,0,0,.4);
+    transition: transform .08s, box-shadow .08s;
+    user-select:none;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px;
+  }
+  .ptt-btn.active {
+    background: radial-gradient(circle at 30% 30%, #4ecf7f, #1a6b3a);
+    box-shadow: 0 4px 24px rgba(78,207,127,.55), inset 0 -4px 0 rgba(0,0,0,.4);
+    transform: translateY(3px) scale(0.97);
+  }
+  .ptt-btn:disabled { opacity:0.4; cursor:not-allowed; }
+  .kbd { font-family:ui-monospace,monospace; padding:2px 8px; background:#1c2532; border:1px solid #334357; border-radius:5px; font-size:11px; }
+  .flash { animation: flash 1s ease-out; }
+  @keyframes flash { from{background:rgba(91,157,255,.15);} to{background:transparent;} }
+  .waveform { display:inline-flex; gap:2px; align-items:end; height:16px; }
+  .waveform span { display:inline-block; width:2px; background:#3ed48f; border-radius:1px; animation: wave 1s ease-in-out infinite; }
+  .waveform span:nth-child(1){ animation-delay:0s;   height:40%; }
+  .waveform span:nth-child(2){ animation-delay:.1s;  height:80%; }
+  .waveform span:nth-child(3){ animation-delay:.2s;  height:50%; }
+  .waveform span:nth-child(4){ animation-delay:.15s; height:100%; }
+  .waveform span:nth-child(5){ animation-delay:.05s; height:60%; }
+  @keyframes wave { 0%,100%{transform:scaleY(.4);} 50%{transform:scaleY(1);} }
+  ::-webkit-scrollbar{ width:8px; height:8px; }
+  ::-webkit-scrollbar-thumb{ background:#22303f; border-radius:4px; }
+  ::-webkit-scrollbar-thumb:hover{ background:#334357; }
+  .step-num { width:28px; height:28px; border-radius:50%; background:#5b9dff; color:#0a0e14; display:inline-flex; align-items:center; justify-content:center; font-weight:700; font-size:13px; flex-shrink:0; }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- ============================ HEADER ============================ -->
+<header class="border-b border-line bg-ink-800/60 backdrop-blur sticky top-0 z-10">
+  <div class="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-accent flex items-center justify-center text-ink-900 font-bold">M</div>
+      <div>
+        <div class="text-[15px] font-semibold leading-tight">MCCG Conference Gateway</div>
+        <div class="text-xs text-muted mono" id="realm-label">loading…</div>
+      </div>
+    </div>
+    <div class="flex items-center gap-4 text-xs">
+      <div class="hidden md:flex items-center gap-2 text-muted">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+        <span class="mono" id="clock">–</span>
+      </div>
+      <span id="conn-badge" class="pill bg-ink-600 text-muted">disconnected</span>
+    </div>
+  </div>
+
+  <!-- Server connection quick-reference -->
+  <div class="border-t border-line bg-ink-900/50">
+    <div class="max-w-7xl mx-auto px-6 py-2.5 flex items-center gap-3 flex-wrap text-xs">
+      <span class="text-muted uppercase tracking-wider font-semibold text-[10px]">Server address for clients:</span>
+      <span class="copy-chip mono" data-copy="server-ip"><span id="server-ip">…</span> <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></span>
+      <span class="text-muted">·</span>
+      <span class="text-muted">SIP:</span> <span class="copy-chip mono" data-copy="sip-port"><span id="sip-endpoint">…:5060</span></span>
+      <span class="text-muted">·</span>
+      <span class="text-muted">Web:</span> <span class="copy-chip mono" data-copy="web-url"><span id="web-endpoint">…:8080</span></span>
+      <span class="text-muted">·</span>
+      <span class="text-muted">RTP:</span> <span class="mono">16384–32767 UDP</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============================ TABS ============================ -->
+<nav class="border-b border-line px-6">
+  <div class="max-w-7xl mx-auto flex gap-8">
+    <button data-tab="overview" class="tab-btn active">
+      <span class="flex items-center gap-2">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        Overview</span>
+    </button>
+    <button data-tab="talk" class="tab-btn">
+      <span class="flex items-center gap-2">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 00-3 3v6a3 3 0 006 0V5a3 3 0 00-3-3z"/><path d="M19 10v1a7 7 0 01-14 0v-1M12 18v3M8 22h8"/></svg>
+        Talk</span>
+    </button>
+    <button data-tab="endpoints" class="tab-btn">
+      <span class="flex items-center gap-2">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>
+        Endpoints</span>
+    </button>
+    <button data-tab="setup" class="tab-btn">
+      <span class="flex items-center gap-2">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+        Setup Guide</span>
+    </button>
+    <button data-tab="audit" class="tab-btn">
+      <span class="flex items-center gap-2">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+        Audit Log</span>
+    </button>
+  </div>
+</nav>
+
+<main class="max-w-7xl mx-auto p-6">
+
+  <!-- ==================== OVERVIEW ==================== -->
+  <section id="tab-overview">
+    <!-- First-run helper (auto-hides after user creates their first endpoint) -->
+    <div id="first-run" class="card p-5 mb-6 border-accent/40 bg-gradient-to-br from-accent/5 to-transparent hidden">
+      <div class="flex items-start gap-4">
+        <div class="w-10 h-10 rounded-lg bg-accent/20 flex items-center justify-center text-accent flex-shrink-0">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        </div>
+        <div class="flex-1">
+          <div class="font-semibold mb-1">Welcome — get started in 3 steps</div>
+          <ol class="text-sm text-muted space-y-1 list-decimal ml-4">
+            <li>Open the <button onclick="goto('setup')" class="text-accent hover:underline">Setup Guide</button> and pick your device type</li>
+            <li>Configure the client with the server address shown in the header</li>
+            <li>Watch this dashboard — the device will appear as an active member</li>
+          </ol>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid md:grid-cols-4 gap-4 mb-6">
+      <div class="card p-4">
+        <div class="text-muted text-xs uppercase tracking-wider mb-1">Talkgroups</div>
+        <div class="text-3xl font-semibold mono" id="stat-tgs">–</div>
+        <div class="text-xs text-muted mt-1" id="stat-tgs-sub">groups configured</div>
+      </div>
+      <div class="card p-4">
+        <div class="text-muted text-xs uppercase tracking-wider mb-1">Endpoints</div>
+        <div class="text-3xl font-semibold mono" id="stat-eps">–</div>
+        <div class="text-xs text-muted mt-1">devices enrolled</div>
+      </div>
+      <div class="card p-4">
+        <div class="text-muted text-xs uppercase tracking-wider mb-1">Active talkers</div>
+        <div class="text-3xl font-semibold mono text-good" id="stat-active">–</div>
+        <div class="text-xs text-muted mt-1">holding the floor</div>
+      </div>
+      <div class="card p-4">
+        <div class="text-muted text-xs uppercase tracking-wider mb-1">JPS peers</div>
+        <div class="text-3xl font-semibold mono" id="stat-jps">–</div>
+        <div class="text-xs text-muted mt-1">radio gateways</div>
+      </div>
+    </div>
+
+    <div class="grid lg:grid-cols-5 gap-6">
+      <!-- Talkgroups -->
+      <div class="lg:col-span-3">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-muted">Talkgroups</h2>
+          <button onclick="refresh()" class="text-xs text-accent hover:underline">refresh</button>
+        </div>
+        <div id="tg-list" class="space-y-3"></div>
+      </div>
+
+      <!-- Activity -->
+      <div class="lg:col-span-2">
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-muted mb-3">Live activity</h2>
+        <div class="card p-4">
+          <div id="event-log" class="text-xs space-y-2 max-h-[520px] overflow-y-auto"></div>
+          <div id="event-empty" class="text-center py-8 text-muted text-sm">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="mx-auto mb-2 opacity-40"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+            Waiting for events…
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== TALK ==================== -->
+  <section id="tab-talk" class="hidden">
+    <div class="mb-4 text-sm text-muted">
+      Hold the button or the <span class="kbd">Space</span> key to transmit to the selected talkgroup.
+      Release to stop.
+    </div>
+
+    <div class="grid lg:grid-cols-5 gap-6">
+      <div class="lg:col-span-3 card p-6">
+        <div class="grid md:grid-cols-2 gap-4 mb-6">
+          <div>
+            <div class="field-label">Talkgroup</div>
+            <select id="dispatch-tg" class="field"></select>
+          </div>
+          <div>
+            <div class="field-label">Your identity</div>
+            <select id="dispatch-ep" class="field"></select>
+          </div>
+        </div>
+
+        <div class="flex flex-col items-center gap-4 py-6">
+          <button id="ptt-btn" class="ptt-btn">
+            <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 00-3 3v6a3 3 0 006 0V5a3 3 0 00-3-3z"/><path d="M19 10v1a7 7 0 01-14 0v-1M12 18v3M8 22h8"/></svg>
+            <span>HOLD TO TALK</span>
+          </button>
+          <div class="text-xs text-muted flex items-center gap-2">
+            or press <span class="kbd">Space</span> anywhere on this tab
+          </div>
+          <div id="ptt-status" class="mono text-sm px-4 py-2 rounded-lg bg-ink-700 text-muted">idle</div>
+        </div>
+      </div>
+
+      <div class="lg:col-span-2 space-y-4">
+        <div class="card p-4">
+          <div class="text-xs uppercase tracking-wider text-muted mb-3">Now transmitting</div>
+          <div id="dispatch-floor" class="space-y-2"></div>
+        </div>
+        <div class="card p-4">
+          <div class="text-xs uppercase tracking-wider text-muted mb-3">Members on this group</div>
+          <div id="dispatch-members" class="space-y-1.5 text-sm mono"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== ENDPOINTS ==================== -->
+  <section id="tab-endpoints" class="hidden">
+    <div class="grid lg:grid-cols-2 gap-6">
+      <!-- Talkgroups admin -->
+      <div>
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-muted">Talkgroups</h2>
+          <button onclick="showModal('new-tg-modal')" class="btn btn-primary">＋ New talkgroup</button>
+        </div>
+        <div class="card">
+          <table class="w-full text-sm">
+            <thead class="border-b border-line text-xs uppercase tracking-wider text-muted">
+              <tr><th class="text-left p-3 font-medium">ID</th><th class="text-left font-medium">Name</th><th class="text-left font-medium">Prio</th><th class="text-left font-medium">Policy</th><th></th></tr>
+            </thead>
+            <tbody id="admin-tg-tbody"></tbody>
+          </table>
+          <div id="admin-tg-empty" class="p-8 text-center text-muted text-sm hidden">No talkgroups yet.</div>
+        </div>
+      </div>
+
+      <!-- Endpoints admin -->
+      <div>
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-muted">Endpoints</h2>
+          <button onclick="showModal('new-ep-modal')" class="btn btn-primary">＋ New endpoint</button>
+        </div>
+        <div class="card">
+          <table class="w-full text-sm">
+            <thead class="border-b border-line text-xs uppercase tracking-wider text-muted">
+              <tr><th class="text-left p-3 font-medium">ID</th><th class="text-left font-medium">Kind</th><th class="text-left font-medium">Talkgroup</th><th class="text-left font-medium">Prio</th><th></th></tr>
+            </thead>
+            <tbody id="admin-ep-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="text-xs text-muted mt-4 flex items-center gap-2">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+      Changes here are in-memory only. Edit <span class="mono">config/*.yaml</span> for permanent changes.
+    </div>
+  </section>
+
+  <!-- ==================== SETUP GUIDE ==================== -->
+  <section id="tab-setup" class="hidden">
+    <div class="mb-6">
+      <h2 class="text-lg font-semibold mb-1">Connect a device to the gateway</h2>
+      <p class="text-sm text-muted">Pick your device type. Copy the values into your client. Come back to the Overview tab to see it appear.</p>
+    </div>
+
+    <div class="grid md:grid-cols-4 gap-2 mb-6">
+      <button data-guide="sip"    class="guide-btn card p-4 text-left card-hover active">
+        <div class="text-2xl mb-1">📞</div>
+        <div class="font-semibold text-sm">SIP Softphone</div>
+        <div class="text-xs text-muted">Linphone, MicroSIP, Zoiper, Bria</div>
+      </button>
+      <button data-guide="jps" class="guide-btn card p-4 text-left card-hover">
+        <div class="text-2xl mb-1">📡</div>
+        <div class="font-semibold text-sm">JPS ACU-Z / RIU-Z</div>
+        <div class="text-xs text-muted">Radio-over-IP gateway</div>
+      </button>
+      <button data-guide="poc" class="guide-btn card p-4 text-left card-hover">
+        <div class="text-2xl mb-1">🎙️</div>
+        <div class="font-semibold text-sm">PoC / MCPTT Handset</div>
+        <div class="text-xs text-muted">Push-to-talk over cellular</div>
+      </button>
+      <button data-guide="webrtc" class="guide-btn card p-4 text-left card-hover">
+        <div class="text-2xl mb-1">🌐</div>
+        <div class="font-semibold text-sm">Web Dispatcher</div>
+        <div class="text-xs text-muted">Any browser</div>
+      </button>
+    </div>
+
+    <div id="guide-content"></div>
+  </section>
+
+  <!-- ==================== AUDIT ==================== -->
+  <section id="tab-audit" class="hidden">
+    <div class="flex items-center justify-between mb-3">
+      <div>
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-muted">Audit log</h2>
+        <div class="text-xs text-muted mt-1">Every register, invite, floor grant, and admin action — JSON lines, appended monotonically.</div>
+      </div>
+      <button onclick="loadAudit()" class="btn btn-ghost">↻ refresh</button>
+    </div>
+    <div class="card p-4">
+      <pre id="audit-pre" class="text-xs mono overflow-x-auto max-h-[70vh] leading-relaxed"></pre>
+      <div id="audit-empty" class="text-center py-12 text-muted text-sm hidden">Log is empty.</div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ============================ MODALS ============================ -->
+<div id="new-tg-modal" class="fixed inset-0 bg-black/60 hidden items-center justify-center z-50 p-4" onclick="if(event.target===this)hideModal('new-tg-modal')">
+  <div class="card p-6 w-full max-w-md">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-semibold">Create talkgroup</h3>
+      <button onclick="hideModal('new-tg-modal')" class="text-muted hover:text-white">✕</button>
+    </div>
+    <form id="new-tg" class="space-y-4">
+      <div>
+        <div class="field-label">ID <span class="text-muted normal-case font-normal">— unique short code</span></div>
+        <input name="id" placeholder="e.g. TG4" required class="field mono">
+      </div>
+      <div>
+        <div class="field-label">Display name</div>
+        <input name="name" placeholder="e.g. Medical Net" required class="field">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <div class="field-label">Priority</div>
+          <select name="priority" class="field">
+            <option value="1">1 — Flash Override</option>
+            <option value="2">2 — Command</option>
+            <option value="3">3 — Immediate</option>
+            <option value="4">4 — Priority</option>
+            <option value="5" selected>5 — Routine</option>
+            <option value="7">7 — Low</option>
+          </select>
+        </div>
+        <div>
+          <div class="field-label">Floor policy</div>
+          <select name="preemptable" class="field">
+            <option value="true">Preemptable</option>
+            <option value="false">Strict FCFS</option>
+          </select>
+        </div>
+      </div>
+      <div class="flex gap-2 justify-end pt-2">
+        <button type="button" onclick="hideModal('new-tg-modal')" class="btn btn-ghost">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="new-ep-modal" class="fixed inset-0 bg-black/60 hidden items-center justify-center z-50 p-4" onclick="if(event.target===this)hideModal('new-ep-modal')">
+  <div class="card p-6 w-full max-w-lg">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-semibold">Create endpoint</h3>
+      <button onclick="hideModal('new-ep-modal')" class="text-muted hover:text-white">✕</button>
+    </div>
+    <form id="new-ep" class="space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <div class="field-label">ID</div>
+          <input name="id" placeholder="e.g. alpha-1" required class="field mono">
+        </div>
+        <div>
+          <div class="field-label">Device type</div>
+          <select name="kind" class="field" onchange="toggleEpFields(this.value)">
+            <option value="sip">SIP softphone</option>
+            <option value="jps">JPS ACU (static RTP)</option>
+            <option value="poc">PoC / MCPTT handset</option>
+            <option value="webrtc">Web browser</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="ep-sip ep-poc space-y-3">
+        <div class="text-xs text-muted -mb-1">SIP credentials the client will use to register:</div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <div class="field-label">SIP username</div>
+            <input name="sip_user" placeholder="e.g. alpha" class="field mono">
+          </div>
+          <div>
+            <div class="field-label">Password</div>
+            <input name="sip_password" type="password" placeholder="secret" class="field mono">
+          </div>
+        </div>
+      </div>
+
+      <div class="ep-jps space-y-3 hidden">
+        <div class="text-xs text-muted -mb-1">JPS ACU's IP and UDP port (where the gateway sends audio):</div>
+        <div class="grid grid-cols-3 gap-3">
+          <div>
+            <div class="field-label">Peer host</div>
+            <input name="peer_host" placeholder="10.10.20.11" class="field mono">
+          </div>
+          <div>
+            <div class="field-label">Peer port</div>
+            <input name="peer_port" type="number" placeholder="40000" class="field mono">
+          </div>
+          <div>
+            <div class="field-label">Local port</div>
+            <input name="local_port" type="number" placeholder="40000" class="field mono">
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3">
+        <div>
+          <div class="field-label">Codec</div>
+          <select name="codec" class="field">
+            <option>PCMU</option><option>PCMA</option><option>opus</option><option>G729</option>
+          </select>
+        </div>
+        <div>
+          <div class="field-label">Talkgroup</div>
+          <select name="default_talkgroup" required class="field" id="ep-tg-select"></select>
+        </div>
+        <div>
+          <div class="field-label">Priority</div>
+          <select name="priority" class="field">
+            <option value="2">2 — Command</option>
+            <option value="4">4 — Priority</option>
+            <option value="5" selected>5 — Routine</option>
+            <option value="7">7 — Low</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="flex gap-2 justify-end pt-2">
+        <button type="button" onclick="hideModal('new-ep-modal')" class="btn btn-ghost">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ============================ SCRIPT ============================ -->
+<script>
+// ============================================================================
+// helpers
+// ============================================================================
+const $  = (s) => document.querySelector(s);
+const $$ = (s) => document.querySelectorAll(s);
+const fmtTime = (ts) => new Date(ts*1000).toLocaleTimeString('en-US',{hour12:false});
+async function api(path, opts={}) {
+  const r = await fetch(path, { headers:{'content-type':'application/json'}, ...opts });
+  if (r.status === 204) return null;
+  const txt = await r.text();
+  try { return JSON.parse(txt); } catch { return txt; }
+}
+function showModal(id){ const m=$('#'+id); m.classList.remove('hidden'); m.classList.add('flex'); if(id==='new-ep-modal') refreshEpTgSelect(); }
+function hideModal(id){ const m=$('#'+id); m.classList.add('hidden'); m.classList.remove('flex'); m.querySelector('form')?.reset(); toggleEpFields('sip'); }
+function goto(tab){ $$('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab===tab));
+  ['overview','talk','endpoints','setup','audit'].forEach(t => $('#tab-'+t).classList.toggle('hidden', t!==tab));
+  if (tab==='audit') loadAudit(); if (tab==='setup') renderGuide(currentGuide); }
+
+// ============================================================================
+// state
+// ============================================================================
+let TGS=[], EPS=[], STATUS={}, currentGuide='sip';
+
+// ============================================================================
+// header — server info + clipboard
+// ============================================================================
+function updateServerInfo() {
+  const host = location.hostname || 'localhost';
+  $('#server-ip').textContent  = host;
+  $('#sip-endpoint').textContent = `${host}:5060`;
+  $('#web-endpoint').textContent = `http://${host}:8080`;
+}
+$$('.copy-chip').forEach(chip => chip.onclick = () => {
+  const t = chip.querySelector('span').textContent;
+  navigator.clipboard?.writeText(t);
+  chip.classList.add('copied');
+  setTimeout(() => chip.classList.remove('copied'), 900);
+});
+
+// ============================================================================
+// tabs
+// ============================================================================
+$$('.tab-btn').forEach(b => b.onclick = () => goto(b.dataset.tab));
+
+// ============================================================================
+// refresh — polls REST every 15s + on state-changing WS events
+// ============================================================================
+async function refresh() {
+  try {
+    STATUS = await api('/api/status');
+    TGS    = await api('/api/talkgroups');
+    EPS    = await api('/api/endpoints');
+  } catch (e) { return; }
+  $('#realm-label').textContent = `${STATUS.realm} · v${STATUS.version}`;
+  $('#stat-tgs').textContent = STATUS.talkgroups;
+  $('#stat-eps').textContent = STATUS.endpoints;
+  $('#stat-jps').textContent = STATUS.jps_peers;
+  $('#stat-active').textContent = TGS.reduce((n,t) => n + t.floor_holders.length, 0);
+  $('#first-run').classList.toggle('hidden', EPS.length > 0);
+  renderTgs(); renderAdmin(); renderDispatch();
+}
+
+// ============================================================================
+// overview — talkgroup cards
+// ============================================================================
+function priorityLabel(p){
+  return p<=2 ? {c:'text-bad',l:'HIGH'} : p<=4 ? {c:'text-warn',l:'MED'} : {c:'text-muted',l:'STD'};
+}
+function renderTgs() {
+  const el = $('#tg-list'); el.innerHTML = '';
+  for (const t of TGS) {
+    const p = priorityLabel(t.priority);
+    const activeCount = t.active_members.length;
+    const holders = t.floor_holders.map(h => `
+      <div class="flex items-center gap-2 text-sm">
+        <span class="waveform"><span></span><span></span><span></span><span></span><span></span></span>
+        <span class="mono text-good">${h}</span>
+      </div>`).join('');
+    el.insertAdjacentHTML('beforeend', `
+      <div class="card p-4 card-hover">
+        <div class="flex items-start justify-between gap-4 mb-3">
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="font-semibold">${t.name}</span>
+              <span class="mono text-xs text-muted">${t.id}</span>
+              <span class="pill bg-ink-600 ${p.c}">${p.l} · P${t.priority}</span>
+            </div>
+            <div class="text-xs text-muted">
+              ${t.preemptable ? 'Preemptable' : 'Strict FCFS'} · ${t.encryption.toUpperCase()} · ${activeCount} member${activeCount===1?'':'s'} active
+            </div>
+          </div>
+        </div>
+        <div class="pt-3 border-t border-line">
+          ${holders || '<div class="text-xs text-muted">No one transmitting</div>'}
+        </div>
+      </div>
+    `);
+  }
+  if (TGS.length === 0) {
+    el.innerHTML = `<div class="card p-8 text-center text-muted text-sm">No talkgroups configured. Create one from <button onclick="goto('endpoints')" class="text-accent hover:underline">Endpoints</button>.</div>`;
+  }
+}
+
+// ============================================================================
+// talk / dispatcher
+// ============================================================================
+function renderDispatch() {
+  const tgSel = $('#dispatch-tg'); const cur = tgSel.value;
+  tgSel.innerHTML = TGS.map(t => `<option value="${t.id}">${t.id} — ${t.name}</option>`).join('');
+  if (cur && TGS.some(t=>t.id===cur)) tgSel.value = cur;
+
+  const epSel = $('#dispatch-ep'); const epCur = epSel.value;
+  const epOptions = EPS.filter(e => e.kind==='webrtc' || e.kind==='sip');
+  epSel.innerHTML = epOptions.length
+    ? epOptions.map(e => `<option value="${e.id}">${e.id} — ${e.display_name || e.kind}</option>`).join('')
+    : '<option value="dispatch-web">dispatch-web (fallback)</option>';
+  if (epCur && epOptions.some(e=>e.id===epCur)) epSel.value = epCur;
+
+  updateFloorPanel();
+}
+function updateFloorPanel() {
+  const t = TGS.find(x => x.id === $('#dispatch-tg').value);
+  if (!t) return;
+  $('#dispatch-floor').innerHTML = t.floor_holders.length
+    ? t.floor_holders.map(h => `
+        <div class="flex items-center gap-2 text-sm">
+          <span class="waveform"><span></span><span></span><span></span><span></span><span></span></span>
+          <span class="mono text-good">${h}</span></div>`).join('')
+    : `<div class="text-sm text-muted">— idle —</div>`;
+  $('#dispatch-members').innerHTML = t.active_members.length
+    ? t.active_members.map(m => `<div class="flex items-center gap-2">
+        <span class="w-1.5 h-1.5 rounded-full bg-good"></span>${m}</div>`).join('')
+    : `<div class="text-muted text-sm">no active members</div>`;
+}
+$('#dispatch-tg').addEventListener('change', updateFloorPanel);
+
+// PTT
+let pttHeld = false;
+async function pttSet(pressed) {
+  if (pressed === pttHeld) return;
+  pttHeld = pressed;
+  $('#ptt-btn').classList.toggle('active', pressed);
+  const tgId = $('#dispatch-tg').value, ep = $('#dispatch-ep').value;
+  if (!tgId || !ep) return;
+  const r = await api(`/api/talkgroups/${encodeURIComponent(tgId)}/ptt`, {
+    method:'POST', body: JSON.stringify({endpoint_id: ep, pressed})
+  });
+  const status = $('#ptt-status');
+  if (pressed) {
+    if (r.granted) { status.textContent = `🟢 TRANSMITTING to ${tgId}`; status.className = 'mono text-sm px-4 py-2 rounded-lg bg-good/20 text-good'; }
+    else          { status.textContent = `🔴 DENIED — floor busy`;      status.className = 'mono text-sm px-4 py-2 rounded-lg bg-bad/20 text-bad'; }
+  } else       { status.textContent = 'idle'; status.className = 'mono text-sm px-4 py-2 rounded-lg bg-ink-700 text-muted'; }
+}
+const pttBtn = $('#ptt-btn');
+pttBtn.addEventListener('mousedown',  () => pttSet(true));
+pttBtn.addEventListener('mouseup',    () => pttSet(false));
+pttBtn.addEventListener('mouseleave', () => pttSet(false));
+pttBtn.addEventListener('touchstart', e => { e.preventDefault(); pttSet(true); });
+pttBtn.addEventListener('touchend',   e => { e.preventDefault(); pttSet(false); });
+window.addEventListener('keydown', e => {
+  if (e.code==='Space' && !e.repeat && !$('#tab-talk').classList.contains('hidden')) { e.preventDefault(); pttSet(true); }
+});
+window.addEventListener('keyup', e => { if (e.code==='Space') pttSet(false); });
+
+// ============================================================================
+// endpoints admin
+// ============================================================================
+function toggleEpFields(kind) {
+  $$('.ep-sip, .ep-poc, .ep-jps').forEach(el => el.classList.add('hidden'));
+  if (kind==='sip' || kind==='poc') $$('.ep-sip').forEach(el => el.classList.remove('hidden'));
+  if (kind==='jps') $$('.ep-jps').forEach(el => el.classList.remove('hidden'));
+}
+function refreshEpTgSelect() {
+  $('#ep-tg-select').innerHTML = TGS.map(t => `<option value="${t.id}">${t.id} — ${t.name}</option>`).join('');
+}
+function renderAdmin() {
+  const kindColor = {sip:'text-accent', jps:'text-warn', poc:'text-good', webrtc:'text-muted'};
+  const tb = $('#admin-tg-tbody'); tb.innerHTML = '';
+  for (const t of TGS) {
+    tb.insertAdjacentHTML('beforeend', `
+      <tr class="border-t border-line hover:bg-ink-700/50">
+        <td class="p-3 mono text-sm">${t.id}</td>
+        <td>${t.name}</td>
+        <td class="mono text-sm">P${t.priority}</td>
+        <td class="text-xs text-muted">${t.preemptable ? 'preemptable' : 'strict'}</td>
+        <td class="p-3 text-right"><button data-del-tg="${t.id}" class="btn btn-danger text-xs">delete</button></td>
+      </tr>`);
+  }
+  $('#admin-tg-empty').classList.toggle('hidden', TGS.length > 0);
+  $$('#admin-tg-tbody [data-del-tg]').forEach(b => b.onclick = async () => {
+    if (!confirm(`Delete talkgroup ${b.dataset.delTg}?`)) return;
+    await api('/api/talkgroups/' + b.dataset.delTg, {method:'DELETE'}); refresh();
+  });
+
+  const tb2 = $('#admin-ep-tbody'); tb2.innerHTML = '';
+  for (const e of EPS) {
+    tb2.insertAdjacentHTML('beforeend', `
+      <tr class="border-t border-line hover:bg-ink-700/50">
+        <td class="p-3 mono text-sm">${e.id}</td>
+        <td class="text-xs ${kindColor[e.kind]||''} uppercase">${e.kind}</td>
+        <td class="mono text-sm">${e.default_talkgroup||'-'}</td>
+        <td class="mono text-sm">P${e.priority}</td>
+        <td class="p-3 text-right"><button data-del-ep="${e.id}" class="btn btn-danger text-xs">delete</button></td>
+      </tr>`);
+  }
+  $$('#admin-ep-tbody [data-del-ep]').forEach(b => b.onclick = async () => {
+    if (!confirm(`Delete endpoint ${b.dataset.delEp}?`)) return;
+    await api('/api/endpoints/' + b.dataset.delEp, {method:'DELETE'}); refresh();
+  });
+}
+$('#new-tg').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  const body = { id:f.get('id'), name:f.get('name'), priority:+f.get('priority'), preemptable:f.get('preemptable')==='true' };
+  const r = await fetch('/api/talkgroups', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
+  if (!r.ok) { alert('Failed: ' + await r.text()); return; }
+  hideModal('new-tg-modal'); refresh();
+};
+$('#new-ep').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const f = new FormData(ev.target); const body = {};
+  for (const [k,v] of f.entries()) if (v!=='') body[k] = v;
+  ['priority','peer_port','local_port'].forEach(k => { if (body[k]) body[k] = +body[k]; });
+  const r = await fetch('/api/endpoints', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
+  if (!r.ok) { alert('Failed: ' + await r.text()); return; }
+  hideModal('new-ep-modal'); refresh();
+};
+
+// ============================================================================
+// setup guide
+// ============================================================================
+$$('.guide-btn').forEach(b => b.onclick = () => { currentGuide = b.dataset.guide; renderGuide(currentGuide); $$('.guide-btn').forEach(x => x.classList.toggle('border-accent', x===b)); });
+function guideValue(k) {
+  const host = location.hostname;
+  const sipUser = EPS.find(e => e.kind==='sip')?.sip_user || 'alpha';
+  const sipPw   = 'see config/endpoints.yaml';
+  const jpsPort = EPS.find(e => e.kind==='jps')?.local_port || 40000;
+  const pocUser = EPS.find(e => e.kind==='poc')?.sip_user || 'echo1';
+  return { host, sipUser, sipPw, jpsPort, pocUser };
+}
+function copyRow(label, value){
+  return `<div class="flex items-center justify-between gap-4 py-2 border-b border-line">
+    <span class="text-sm text-muted">${label}</span>
+    <span class="copy-row copy-chip mono">${value} <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></span>
+  </div>`;
+}
+function step(n, title, body){
+  return `<div class="flex gap-4 mb-6">
+    <span class="step-num">${n}</span>
+    <div class="flex-1">
+      <div class="font-semibold mb-2">${title}</div>
+      <div class="text-sm text-muted">${body}</div>
+    </div></div>`;
+}
+function renderGuide(kind) {
+  const v = guideValue(kind);
+  let html = '';
+  if (kind==='sip') {
+    html = `
+      <div class="card p-6">
+        <h3 class="font-semibold text-lg mb-2">Connect a SIP softphone</h3>
+        <p class="text-sm text-muted mb-6">Works with any RFC 3261 client. Free options: <b>Linphone</b> (all platforms), <b>MicroSIP</b> (Windows), <b>Zoiper</b> (all).</p>
+
+        ${step(1, 'Install a SIP client', `Download <a href="https://www.linphone.org/technical-corner/linphone/downloads" target="_blank" class="text-accent">Linphone</a> — it's free and open source. Available for macOS, Windows, iOS, Android, Linux.`)}
+        ${step(2, 'Add a SIP account', `In Linphone: <span class="mono">Preferences → Accounts → Add</span>. Enter these values:`)}
+
+        <div class="ml-12 card p-4 mb-6">
+          ${copyRow('Username',      v.sipUser)}
+          ${copyRow('Password',      v.sipPw)}
+          ${copyRow('SIP Domain',    v.host)}
+          ${copyRow('Proxy / Server',`sip:${v.host}:5060`)}
+          ${copyRow('Transport',     'UDP')}
+        </div>
+
+        ${step(3, 'Verify registration', `You should see "Registered" in the softphone. On the <button onclick="goto('overview')" class="text-accent hover:underline">Overview</button> tab a new register event appears in the activity feed.`)}
+        ${step(4, 'Join the conference', `Dial <span class="mono">100</span> (any number works — the gateway auto-answers). You're now in your default talkgroup. Speak or hold PTT if your phone has one.`)}
+
+        <div class="mt-4 p-4 rounded-lg bg-accent/10 border border-accent/30 text-sm">
+          <b>Real accounts to use:</b> passwords are in <span class="mono">config/endpoints.yaml</span>. Change them before any real deployment.
+        </div>
+      </div>`;
+  } else if (kind==='jps') {
+    html = `
+      <div class="card p-6">
+        <h3 class="font-semibold text-lg mb-2">Connect a JPS ACU-Z / RIU-Z radio gateway</h3>
+        <p class="text-sm text-muted mb-6">The ACU has no SIP stack — it streams G.711 RTP to a fixed IP:port. We do the same in reverse. Configure the ACU's VoIP output to point at us.</p>
+
+        ${step(1, 'Open the ACU web interface', `Browse to your ACU's admin IP (typically <span class="mono">192.168.1.200</span>) and log in.`)}
+        ${step(2, 'Configure the VoIP endpoint', `Under <span class="mono">Setup → VoIP</span> (name varies by firmware), create a new remote endpoint with:`)}
+
+        <div class="ml-12 card p-4 mb-6">
+          ${copyRow('Remote IP',      v.host)}
+          ${copyRow('Remote port',    v.jpsPort)}
+          ${copyRow('Local port',     v.jpsPort)}
+          ${copyRow('Codec',          'G.711 μ-law (PCMU)')}
+          ${copyRow('Packet time',    '20 ms')}
+          ${copyRow('Signaling',      'None (static peer)')}
+        </div>
+
+        ${step(3, 'Enroll the ACU in the gateway', `Go to <button onclick="goto('endpoints')" class="text-accent hover:underline">Endpoints</button>, click "New endpoint", pick <b>JPS ACU</b>. Enter the ACU's IP as <span class="mono">peer_host</span> and its listening port as <span class="mono">peer_port</span>.`)}
+        ${step(4, 'Verify audio flow', `Key the radio net; the ACU appears as an active member on the Overview tab. Radio-net PTT is honored by the gateway — the JPS peer always holds the floor.`)}
+      </div>`;
+  } else if (kind==='poc') {
+    html = `
+      <div class="card p-6">
+        <h3 class="font-semibold text-lg mb-2">Connect a PoC / MCPTT handset</h3>
+        <p class="text-sm text-muted mb-6">Push-to-Talk over Cellular. Uses SIP for signaling and MBCP (Media Burst Control Protocol, 3GPP TS 24.380) for floor control.</p>
+
+        ${step(1, 'Install a compatible client', `Any 3GPP MCPTT client works. Some SIP softphones with PTT support (like Groundwire) can also connect but won't use MBCP — they'll fall back to SIP INFO for floor control.`)}
+        ${step(2, 'Configure the handset', ``)}
+
+        <div class="ml-12 card p-4 mb-6">
+          ${copyRow('SIP Server',    `${v.host}:5060`)}
+          ${copyRow('Username',      v.pocUser)}
+          ${copyRow('Password',      v.sipPw)}
+          ${copyRow('Codec',         'Opus (or AMR-WB)')}
+          ${copyRow('PTT floor',     'MBCP over RTCP-mux')}
+        </div>
+
+        ${step(3, 'Join a talkgroup', `Once registered, initiate the group call. The handset joins its default talkgroup. Press-and-hold PTT to speak — floor is arbitrated by priority.`)}
+      </div>`;
+  } else if (kind==='webrtc') {
+    html = `
+      <div class="card p-6">
+        <h3 class="font-semibold text-lg mb-2">Web dispatcher — any browser</h3>
+        <p class="text-sm text-muted mb-6">Zero install. Works on any modern browser (Chrome, Safari, Firefox, Edge).</p>
+
+        ${step(1, 'Open the URL from any device on the same network', `Enter this in the browser address bar:`)}
+        <div class="ml-12 card p-4 mb-6">${copyRow('Console URL', `http://${v.host}:8080/`)}</div>
+
+        ${step(2, 'Go to the Talk tab', `Click <button onclick="goto('talk')" class="text-accent hover:underline">Talk</button> in the top nav.`)}
+        ${step(3, 'Pick a talkgroup and identity', `Choose which talkgroup to transmit on and your dispatcher identity from the dropdowns.`)}
+        ${step(4, 'Hold to talk', `Press and hold the big red button, or hold the <span class="kbd">Space</span> key. The button turns green and status shows "TRANSMITTING". Release to stop.`)}
+
+        <div class="mt-4 p-4 rounded-lg bg-warn/10 border border-warn/30 text-sm">
+          <b>Note:</b> the PTT button currently controls the floor only. Live microphone streaming from the browser to the conference bridge is queued up in the WebRTC module but not wired yet — say the word if you want that turned on.
+        </div>
+      </div>`;
+  }
+  $('#guide-content').innerHTML = html;
+  // wire copy-row clicks
+  $$('#guide-content .copy-row').forEach(r => r.onclick = () => {
+    const t = r.childNodes[0].textContent.trim();
+    navigator.clipboard?.writeText(t);
+    r.classList.add('copied');
+    setTimeout(() => r.classList.remove('copied'), 900);
+  });
+}
+
+// ============================================================================
+// audit
+// ============================================================================
+async function loadAudit() {
+  const events = await api('/api/audit?n=100');
+  if (!events || events.length===0) {
+    $('#audit-pre').textContent = ''; $('#audit-empty').classList.remove('hidden'); return;
+  }
+  $('#audit-empty').classList.add('hidden');
+  $('#audit-pre').textContent = events.map(e => JSON.stringify(e)).join('\n');
+}
+
+// ============================================================================
+// WebSocket
+// ============================================================================
+function eventIcon(t){
+  const map = {ptt:'🎙', invite:'📞', bye:'👋', ep_create:'➕', ep_delete:'➖', tg_create:'➕', tg_delete:'➖', start:'🟢', stop:'🔴'};
+  return map[t] || '•';
+}
+function eventColor(t){
+  if (t.includes('delete') || t==='bye') return 'text-bad';
+  if (t.includes('create') || t==='start') return 'text-good';
+  if (t==='ptt') return 'text-accent';
+  return 'text-muted';
+}
+function connectWS() {
+  const proto = location.protocol==='https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/events`);
+  const badge = $('#conn-badge');
+  ws.onopen = () => { badge.textContent = '● live'; badge.className = 'pill bg-good/20 text-good'; };
+  ws.onclose = () => { badge.textContent = 'reconnecting…'; badge.className = 'pill bg-warn/20 text-warn'; setTimeout(connectWS, 2000); };
+  ws.onmessage = (m) => {
+    const ev = JSON.parse(m.data);
+    const log = $('#event-log'); $('#event-empty').classList.add('hidden');
+    const fields = Object.entries(ev).filter(([k])=>k!=='ts'&&k!=='type')
+      .map(([k,v]) => `<span class="text-muted">${k}=</span><span class="mono">${v}</span>`).join(' ');
+    const div = document.createElement('div');
+    div.className = 'flash rounded p-2 flex items-start gap-3';
+    div.innerHTML = `
+      <span class="text-lg leading-none">${eventIcon(ev.type)}</span>
+      <div class="flex-1 min-w-0">
+        <div class="flex items-baseline gap-2">
+          <span class="font-semibold text-sm ${eventColor(ev.type)}">${ev.type}</span>
+          <span class="text-[10px] text-muted mono">${fmtTime(ev.ts)}</span>
+        </div>
+        <div class="text-xs mt-0.5 truncate">${fields}</div>
+      </div>`;
+    log.prepend(div);
+    while (log.children.length > 100) log.lastChild.remove();
+    if (['ptt','ep_create','ep_delete','tg_create','tg_delete','invite','bye'].includes(ev.type)) refresh();
+  };
+}
+
+// ============================================================================
+// boot
+// ============================================================================
+updateServerInfo();
+setInterval(() => $('#clock').textContent = new Date().toISOString().replace('T',' ').slice(0,19)+'Z', 1000);
+refresh(); renderGuide('sip'); connectWS();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

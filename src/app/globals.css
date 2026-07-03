@@ -1,0 +1,144 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f4f4f5; /* Light zinc background */
+  --foreground: #18181b; /* Dark zinc text */
+  --card: #ffffff;       /* Pure white card */
+  --card-border: #e4e4e7; /* Light zinc border */
+  --bezel: #fafafa;
+  --inset: #f4f4f5;
+  --border-light: #f4f4f5;
+  
+  --primary: #18181b;
+  --primary-glow: rgba(24, 24, 27, 0.05);
+  --secondary: #71717a;
+  --accent: #ca8a04;
+  --accent-glow: rgba(202, 138, 4, 0.05);
+  --success: #10b981; /* Clean Emerald green */
+  --error: #ef4444;   /* Rose red */
+  --warning: #f59e0b;
+  --border: #e4e4e7;
+  --muted-foreground: #71717a;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-border: var(--card-border);
+  --color-primary: var(--primary);
+  --color-primary-glow: var(--primary-glow);
+  --color-secondary: var(--secondary);
+  --color-accent: var(--accent);
+  --color-accent-glow: var(--accent-glow);
+  --color-success: var(--success);
+  --color-error: var(--error);
+  --color-warning: var(--warning);
+  --color-muted-border: var(--border);
+  --color-muted-text: var(--muted-foreground);
+  
+  --color-mil-bg: var(--background);
+  --color-mil-bezel: var(--bezel);
+  --color-mil-panel: var(--card);
+  --color-mil-inset: var(--inset);
+  --color-mil-border: var(--card-border);
+  --color-mil-border-light: var(--border-light);
+  --color-mil-blue: var(--bezel);
+  --color-mil-ice: var(--secondary);
+  --color-mil-white: var(--foreground);
+  --color-mil-green: var(--success);
+  --color-mil-amber: var(--warning);
+  --color-mil-red: var(--error);
+  --color-mil-muted: var(--muted-foreground);
+  
+  --font-sans: system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, monospace;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Sharp inputs/buttons */
+select,
+input,
+button {
+  border-radius: 4px !important; /* Slight rounded corners for modern clean look */
+}
+
+input[type="range"] {
+  accent-color: #18181b;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50% !important; /* Circular dots for clean aesthetic */
+}
+
+/* Custom minimal pulse for active routing */
+@keyframes active-pulse {
+  0%, 100% {
+    border-color: var(--success);
+    background-color: rgba(16, 185, 129, 0.05);
+  }
+  50% {
+    border-color: #34d399;
+    background-color: rgba(16, 185, 129, 0.15);
+  }
+}
+
+.animate-glow-pulse {
+  animation: active-pulse 2s infinite ease-in-out;
+}
+
+@keyframes dialing-pulse {
+  0%, 100% {
+    border-color: var(--warning);
+    background-color: rgba(245, 158, 11, 0.05);
+  }
+  50% {
+    border-color: #fbbf24;
+    background-color: rgba(245, 158, 11, 0.15);
+  }
+}
+
+.animate-accent-glow-pulse {
+  animation: dialing-pulse 1.5s infinite ease-in-out;
+}
+
+/* Collapsible drawer styling */
+.settings-overlay {
+  position: absolute;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.4);
+  z-index: 100;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f4f4f5;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d4d4d8;
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a1a1aa;
+}

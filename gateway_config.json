@@ -1,0 +1,126 @@
+{
+  "sipPort": 5060,
+  "selectedDevice": "NDI Audio",
+  "channels": [
+    {
+      "id": 1,
+      "label": "CH 01",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.101",
+      "targetPort": 5004,
+      "sipUser": "receiver1",
+      "codec": "G.711µ",
+      "localPort": null
+    },
+    {
+      "id": 2,
+      "label": "CH 02",
+      "protocol": "SIP",
+      "targetIp": "192.168.1.102",
+      "targetPort": 5060,
+      "sipUser": null,
+      "codec": "G.722",
+      "localPort": null
+    },
+    {
+      "id": 3,
+      "label": "CH 03",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.103",
+      "targetPort": 5004,
+      "sipUser": "receiver3",
+      "codec": "Opus",
+      "localPort": null
+    },
+    {
+      "id": 4,
+      "label": "CH 04",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.104",
+      "targetPort": 5004,
+      "sipUser": "receiver4",
+      "codec": "G.711µ",
+      "localPort": null
+    },
+    {
+      "id": 5,
+      "label": "CH 05",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.105",
+      "targetPort": 5004,
+      "sipUser": "receiver5",
+      "codec": "G.722",
+      "localPort": null
+    },
+    {
+      "id": 6,
+      "label": "CH 06",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.106",
+      "targetPort": 5004,
+      "sipUser": "receiver6",
+      "codec": "Opus",
+      "localPort": null
+    },
+    {
+      "id": 7,
+      "label": "CH 07",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.107",
+      "targetPort": 5004,
+      "sipUser": "receiver7",
+      "codec": "G.711µ",
+      "localPort": null
+    },
+    {
+      "id": 8,
+      "label": "CH 08",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.108",
+      "targetPort": 5004,
+      "sipUser": "receiver8",
+      "codec": "G.722",
+      "localPort": null
+    },
+    {
+      "id": 9,
+      "label": "CH 09",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.109",
+      "targetPort": 5004,
+      "sipUser": "receiver9",
+      "codec": "Opus",
+      "localPort": null
+    },
+    {
+      "id": 10,
+      "label": "CH 10",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.1010",
+      "targetPort": 5004,
+      "sipUser": "receiver10",
+      "codec": "G.711µ",
+      "localPort": null
+    },
+    {
+      "id": 11,
+      "label": "CH 11",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.1011",
+      "targetPort": 5004,
+      "sipUser": "receiver11",
+      "codec": "G.722",
+      "localPort": null
+    },
+    {
+      "id": 12,
+      "label": "CH 12",
+      "protocol": "RTP",
+      "targetIp": "192.168.1.1012",
+      "targetPort": 5004,
+      "sipUser": "receiver12",
+      "codec": "Opus",
+      "localPort": null
+    }
+  ]
+}

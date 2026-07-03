@@ -1,0 +1,68 @@
+# -------- Endpoint enrolment --------
+endpoints:
+  # ---------- SIP console (softphone or hardware console) ----------
+  - id: console-alpha
+    kind: sip
+    display_name: "TOC Alpha Console"
+    sip_user: alpha
+    sip_password: "change-me-alpha"
+    codec: opus
+    default_talkgroup: TG1
+    priority: 2                     # command
+
+  - id: console-bravo
+    kind: sip
+    display_name: "TOC Bravo Console"
+    sip_user: bravo
+    sip_password: "change-me-bravo"
+    codec: PCMU
+    default_talkgroup: TG1
+    priority: 3
+
+  # ---------- JPS ACU-Z / RIU-Z radio gateway (static peer) ----------
+  - id: jps-acuz-1
+    kind: jps
+    display_name: "JPS ACU-Z HF Link"
+    peer_host: 10.10.20.11
+    peer_port: 40000
+    local_port: 40000
+    codec: PCMU
+    default_talkgroup: TG1
+    priority: 4
+
+  - id: jps-acuz-2
+    kind: jps
+    display_name: "JPS ACU-Z VHF Link"
+    peer_host: 10.10.20.12
+    peer_port: 40002
+    local_port: 40002
+    codec: PCMU
+    default_talkgroup: TG2
+    priority: 5
+
+  # ---------- MCPTT PoC handsets ----------
+  - id: poc-echo-1
+    kind: poc
+    display_name: "Echo-1 Handset"
+    sip_user: echo1
+    sip_password: "change-me-echo1"
+    codec: opus
+    default_talkgroup: TG2
+    priority: 6
+
+  - id: poc-echo-2
+    kind: poc
+    display_name: "Echo-2 Handset"
+    sip_user: echo2
+    sip_password: "change-me-echo2"
+    codec: opus
+    default_talkgroup: TG2
+    priority: 6
+
+  # ---------- WebRTC dispatcher ----------
+  - id: dispatch-web
+    kind: webrtc
+    display_name: "Web Dispatcher"
+    codec: opus
+    default_talkgroup: TG1
+    priority: 3

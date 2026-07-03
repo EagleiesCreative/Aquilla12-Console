@@ -1,0 +1,24 @@
+# -------- Talkgroup definitions --------
+# priority: 1 (flash-override) … 9 (routine)
+# preemptable: whether higher-priority PTT can steal the floor
+talkgroups:
+  - id: TG1
+    name: "Command Net"
+    priority: 2
+    preemptable: true
+    encryption: srtp
+    members: [console-alpha, console-bravo, jps-acuz-1, dispatch-web]
+
+  - id: TG2
+    name: "Ops Net"
+    priority: 5
+    preemptable: true
+    encryption: srtp
+    members: [console-alpha, jps-acuz-2, poc-echo-1, poc-echo-2]
+
+  - id: TG3
+    name: "Logistics"
+    priority: 7
+    preemptable: false
+    encryption: none
+    members: [console-bravo, poc-echo-2]

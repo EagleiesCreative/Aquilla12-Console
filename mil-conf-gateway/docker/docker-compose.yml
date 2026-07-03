@@ -1,0 +1,24 @@
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: mccg/gateway:1.0.0
+    container_name: mccg-gateway
+    restart: unless-stopped
+    network_mode: host          # required so SDP c-line matches actual IP
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MCCG_LOG_LEVEL=INFO
+    volumes:
+      - ../config:/app/config:ro
+      - mccg-logs:/var/log/mccg
+      - ./tls:/etc/mccg/tls:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(2);s.sendto(b'',('127.0.0.1',5060));sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  mccg-logs:

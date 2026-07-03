@@ -1,0 +1,4 @@
+{"seq": 1, "ts": "2026-07-02T09:45:22.952021+00:00", "event": "tg_create", "talkgroup": "TG9"}
+{"seq": 2, "ts": "2026-07-02T09:45:22.964669+00:00", "event": "tg_delete", "talkgroup": "TG9"}
+{"seq": 3, "ts": "2026-07-02T09:45:22.966877+00:00", "event": "ep_create", "endpoint": "test-ep", "kind": "sip"}
+{"seq": 4, "ts": "2026-07-02T09:45:22.968323+00:00", "event": "ep_delete", "endpoint": "test-ep"}
