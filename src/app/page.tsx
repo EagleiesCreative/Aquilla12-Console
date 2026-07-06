@@ -4,7 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { DashboardHeader } from "@/components/DashboardHeader";
 import { ChannelCard } from "@/components/ChannelCard";
 import { SystemConsole } from "@/components/SystemConsole";
-import { CallStatus, ChannelState, CodecType, GlobalSettings, LogEntry, LogLevel } from "@/lib/types";
+import { DispatchMatrixPanel } from "@/components/DispatchMatrixPanel";
+import { CallStatus, ChannelState, CodecType, DispatchGroup, GlobalSettings, LogEntry, LogLevel } from "@/lib/types";
 import { parseSbcAddress } from "@/lib/utils";
 import { Mic, Network, Server, ToggleLeft, ToggleRight, X } from "lucide-react";
 
@@ -37,6 +38,11 @@ const INITIAL_CHANNELS: ChannelState[] = Array.from({ length: 12 }).map((_, inde
     ampPort: 5004 + index * 2,
     ampStreaming: false,
     ampEnabled: true,
+    bridgeIp: "127.0.0.1",
+    bridgePort: 6004 + index * 2,
+    bridgeEnabled: false,
+    bridgeConnected: false,
+    dispatchConnected: false,
   };
 });
 
@@ -50,6 +56,7 @@ export default function Home() {
     selectedDevice: "",
     availableDevices: [],
     ampEnabled: true,
+    bridgeEnabled: true,
   });
 
   const [channels, setChannels] = useState<ChannelState[]>(INITIAL_CHANNELS);
@@ -59,6 +66,8 @@ export default function Home() {
 
   const [showSettings, setShowSettings] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [showDispatchMatrix, setShowDispatchMatrix] = useState(false);
+  const [dispatchGroups, setDispatchGroups] = useState<DispatchGroup[]>([]);
 
   const socketRef = useRef<WebSocket | null>(null);
   const connectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -102,13 +111,26 @@ export default function Home() {
         let initialDevice = "";
         let initialLocalIp = "";
         let initialAmpEnabled = true;
+        let initialBridgeEnabled = true;
         if (configRes.ok) {
           const cfg = await configRes.json();
           initialSipPort = cfg.sipPort || "5060";
           initialDevice = cfg.selectedDevice || "";
           initialLocalIp = cfg.localIp || "";
           if (cfg.ampEnabled !== undefined) initialAmpEnabled = cfg.ampEnabled;
+          if (cfg.bridgeEnabled !== undefined) initialBridgeEnabled = cfg.bridgeEnabled;
         }
+
+        fetch(`${parsed.httpUrl}/api/dispatch/matrix`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data) => {
+            if (data && Array.isArray(data.groups)) {
+              setDispatchGroups(data.groups);
+            }
+          })
+          .catch(() => {
+            /* Dispatcher matrix unavailable (e.g. simulator mode) — panel shows a loading state */
+          });
 
         const res = await fetch(`${parsed.httpUrl}/api/audio-devices`);
         if (res.ok) {
@@ -129,6 +151,7 @@ export default function Home() {
               sipPort: initialSipPort,
               localIp: initialLocalIp || prev.localIp,
               ampEnabled: initialAmpEnabled,
+              bridgeEnabled: initialBridgeEnabled,
             };
           });
         }
@@ -252,6 +275,7 @@ export default function Home() {
                 txKbps: 0,
                 pttActive: false,
                 ampStreaming: (settings.ampEnabled ?? true) && (ch.ampEnabled ?? true),
+                bridgeConnected: (settings.bridgeEnabled ?? true) && (ch.bridgeEnabled ?? false),
               }
             : ch
         )
@@ -291,6 +315,7 @@ export default function Home() {
                     txKbps: 0,
                     pttActive: false,
                     ampStreaming: (settings.ampEnabled ?? true) && (ch.ampEnabled ?? true),
+                    bridgeConnected: (settings.bridgeEnabled ?? true) && (ch.bridgeEnabled ?? false),
                   }
                 : ch
             );
@@ -322,6 +347,8 @@ export default function Home() {
               txKbps: 0,
               pttActive: false,
               ampStreaming: false,
+              bridgeConnected: false,
+              dispatchConnected: false,
             }
           : ch
       );
@@ -432,7 +459,13 @@ export default function Home() {
                 selectedDevice: cfg.selectedDevice || prev.selectedDevice,
                 localIp: cfg.localIp || prev.localIp,
                 ampEnabled: cfg.ampEnabled !== undefined ? cfg.ampEnabled : prev.ampEnabled,
+                bridgeEnabled: cfg.bridgeEnabled !== undefined ? cfg.bridgeEnabled : prev.bridgeEnabled,
               }));
+            } else if (payload.type === "dispatch_matrix_update") {
+              const groups = payload.data?.groups;
+              if (Array.isArray(groups)) {
+                setDispatchGroups(groups);
+              }
             } else if (payload.type === "audio_level") {
               const { id, level } = payload.data;
               setChannels((prev) =>
@@ -531,6 +564,24 @@ export default function Home() {
     }
   };
 
+  // Local (optimistic) update for the Dispatcher patch matrix — the backend's
+  // own `dispatch_matrix_update` broadcast is the source of truth and will
+  // correct this a moment later if it ever disagrees.
+  const handleDispatchToggle = (groupId: number, channelId: number, isMember: boolean) => {
+    setDispatchGroups((prev) =>
+      prev.map((g) =>
+        g.id === groupId
+          ? {
+              ...g,
+              memberIds: isMember
+                ? g.memberIds.includes(channelId) ? g.memberIds : [...g.memberIds, channelId]
+                : g.memberIds.filter((c) => c !== channelId),
+            }
+          : g
+      )
+    );
+  };
+
   const activeCallsCount = channels.filter((ch) => ch.status === "CONNECTED").length;
   const totalBandwidth = channels.reduce(
     (acc, ch) => {
@@ -554,6 +605,7 @@ export default function Home() {
         activeCallsCount={activeCallsCount}
         onToggleSettings={() => setShowSettings(true)}
         onToggleLogs={() => setShowLogs(true)}
+        onToggleDispatchMatrix={() => setShowDispatchMatrix(true)}
         isSecure={isSecure}
       />
 
@@ -667,6 +719,19 @@ export default function Home() {
             logs={logs}
             onClearLogs={handleClearLogs}
             onClose={() => setShowLogs(false)}
+          />
+        </div>
+      )}
+
+      {/* Dispatcher Patch Matrix Modal Overlay */}
+      {showDispatchMatrix && (
+        <div className="absolute inset-0 bg-black/40 z-50 flex items-center justify-center animate-fade-in">
+          <DispatchMatrixPanel
+            channels={channels}
+            groups={dispatchGroups}
+            httpBaseUrl={parseSbcAddress(settings.sbcIp || "localhost")?.httpUrl ?? null}
+            onClose={() => setShowDispatchMatrix(false)}
+            onToggle={handleDispatchToggle}
           />
         </div>
       )}

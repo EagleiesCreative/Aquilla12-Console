@@ -50,3 +50,7 @@ next-env.d.ts
 **/__pycache__/
 *.pyc
 .pytest_cache/
+
+.claude
+*.md
+*.docx

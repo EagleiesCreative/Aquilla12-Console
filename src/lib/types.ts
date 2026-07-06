@@ -29,6 +29,15 @@ export interface ChannelState {
   ampPort?: number;
   ampStreaming?: boolean;
   ampEnabled?: boolean;
+  bridgeIp?: string;
+  bridgePort?: number;
+  bridgeEnabled?: boolean;
+  /** Fixed local UDP port the ACU peer should send its RTP to. Undefined/0 = auto (ephemeral, not stable across calls). */
+  bridgeLocalPort?: number;
+  /** Runtime status: true while a live two-way ACU Bridge leg is up for this call. */
+  bridgeConnected?: boolean;
+  /** Runtime status: true while this channel is actively patched into a Dispatcher group with a live call. */
+  dispatchConnected?: boolean;
 }
 
 export interface GlobalSettings {
@@ -40,6 +49,17 @@ export interface GlobalSettings {
   availableDevices: string[];
   localIp?: string;
   ampEnabled?: boolean;
+  bridgeEnabled?: boolean;
+}
+
+export interface DispatchGroup {
+  id: number;
+  name: string;
+  memberIds: number[];
+  mirrorEnabled: boolean;
+  mirrorIp: string;
+  mirrorPort: number;
+  mirrorLocalPort?: number;
 }
 
 export type LogLevel = 'info' | 'success' | 'warning' | 'error' | 'sip_tx' | 'sip_rx';

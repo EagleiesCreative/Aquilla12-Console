@@ -1108,6 +1108,9 @@ fn start_microphone_rtp(
             // Standard point-to-point PTT logic
             let mut interval = tokio::time::interval(Duration::from_millis(20));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Tracks the last time ANY RTP packet (real audio or keep-alive) was
+            // actually put on the wire, so we know when a 5s silence burst is due.
+            let mut last_sent = tokio::time::Instant::now();
             while let Some(audio_chunk) = rx_audio.recv().await {
                 resampler.process(&audio_chunk, &mut pcm_buffer);
                 
@@ -1149,20 +1152,50 @@ fn start_microphone_rtp(
                         packet[12 + i] = linear_to_ulaw(chunk_160[i]);
                     }
                     
-                    if ptt_active_clone.load(Ordering::SeqCst) {
-                        if srtp_enabled {
+                    let ptt_on = ptt_active_clone.load(Ordering::SeqCst);
+                    let now = tokio::time::Instant::now();
+                    // If PTT has been idle for 5s+, still fire a silent RTP burst so the
+                    // far-end (JPS) RTP watchdog keeps seeing packets and doesn't flag the
+                    // link "no audio / warning", even though nothing is actually being said.
+                    let due_for_keepalive = !ptt_on && now.duration_since(last_sent) >= Duration::from_secs(5);
+
+                    if ptt_on || due_for_keepalive {
+                        // Real mic bytes when PTT is pressed; silence (µ-law digital-zero)
+                        // for the periodic keep-alive so an idle mic never leaks audio.
+                        let out_payload: Vec<u8> = if ptt_on {
+                            packet[12..].to_vec()
+                        } else {
+                            vec![linear_to_ulaw(0); 160]
+                        };
+
+                        let sent = if srtp_enabled {
                             let ctx = secure_context.lock().await;
                             if let Some(ref keys) = ctx.keys {
-                                let mut payload = packet[12..].to_vec();
+                                let mut payload = out_payload;
                                 if let Ok(tag) = crypto::encrypt_rtp_gcm(keys, sequence_number, timestamp, ssrc, &mut payload) {
                                     let mut srtp_packet = packet[0..12].to_vec();
                                     srtp_packet.extend_from_slice(&payload);
                                     srtp_packet.extend_from_slice(&tag);
                                     let _ = rtp_socket_clone.send_to(&srtp_packet, &rtp_dest_clone).await;
+                                    true
+                                } else {
+                                    false
                                 }
+                            } else {
+                                false
                             }
                         } else {
-                            let _ = rtp_socket_clone.send_to(&packet, &rtp_dest_clone).await;
+                            let mut out_packet = packet[0..12].to_vec();
+                            out_packet.extend_from_slice(&out_payload);
+                            let _ = rtp_socket_clone.send_to(&out_packet, &rtp_dest_clone).await;
+                            true
+                        };
+
+                        if sent {
+                            last_sent = now;
+                            if due_for_keepalive {
+                                println!("[RTP Keep-Alive] No PTT audio for 5s — sent silence burst to {} to hold link status", rtp_dest_clone);
+                            }
                         }
                     }
                     

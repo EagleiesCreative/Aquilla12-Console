@@ -34,6 +34,8 @@ export function ChannelCard({
     volume = 100,
     srtpEnabled = true,
     ampStreaming = false,
+    bridgeConnected = false,
+    dispatchConnected = false,
   } = channel;
 
   const lastTapRef = useRef<number>(0);
@@ -199,6 +201,24 @@ export function ChannelCard({
             <span className="relative flex h-2 w-2">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500"></span>
+            </span>
+          </div>
+        )}
+        {/* ACU Bridge Indicator (two-way interop leg, distinct from the A-MP mirror above) */}
+        {bridgeConnected && (
+          <div className="absolute left-4 top-0.5 flex items-center justify-center" title="ACU Bridge Active (two-way leg mixed into this call)">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-sky-500"></span>
+            </span>
+          </div>
+        )}
+        {/* Dispatcher Indicator (patched into an inter-channel group, distinct from ACU Bridge/A-MP above) */}
+        {dispatchConnected && (
+          <div className="absolute left-8 top-0.5 flex items-center justify-center" title="Dispatcher Patch Active (audio bridged with other patched channels)">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
             </span>
           </div>
         )}

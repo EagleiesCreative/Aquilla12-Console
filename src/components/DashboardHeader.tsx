@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Settings, Terminal, Wifi, Shield, ShieldAlert } from "lucide-react";
+import { Settings, Terminal, Wifi, Shield, ShieldAlert, GitMerge } from "lucide-react";
 import { GlobalSettings } from "@/lib/types";
 
 interface DashboardHeaderProps {
@@ -9,6 +9,7 @@ interface DashboardHeaderProps {
   activeCallsCount: number;
   onToggleSettings: () => void;
   onToggleLogs: () => void;
+  onToggleDispatchMatrix?: () => void;
   showLogsButton?: boolean;
   isSecure?: boolean;
 }
@@ -18,6 +19,7 @@ export function DashboardHeader({
   activeCallsCount,
   onToggleSettings,
   onToggleLogs,
+  onToggleDispatchMatrix,
   showLogsButton = true,
   isSecure = true,
 }: DashboardHeaderProps) {
@@ -72,6 +74,17 @@ export function DashboardHeader({
             {settings.isSimulatorMode ? "SIM" : settings.isConnected ? "LIVE" : "OFFLINE"}
           </span>
         </div>
+
+        {/* Dispatcher Patch Matrix Button */}
+        {onToggleDispatchMatrix && (
+          <button
+            onClick={onToggleDispatchMatrix}
+            className="p-1 rounded hover:bg-gray-100 border border-gray-200 text-gray-600 transition cursor-pointer flex items-center justify-center h-5 w-5"
+            title="Dispatcher Patch Matrix"
+          >
+            <GitMerge className="h-3 w-3" />
+          </button>
+        )}
 
         {/* Logs Button */}
         {showLogsButton && (

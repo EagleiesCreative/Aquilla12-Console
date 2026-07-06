@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, State, WebSocketUpgrade, Form, Query, ws::{Message, WebSocket}},
     http::StatusCode,
-    response::{IntoResponse, Html, Redirect},
+    response::{IntoResponse, Html},
     routing::{get, post},
     Json, Router,
 };
@@ -67,6 +67,18 @@ struct ChannelConfig {
     amp_port: u16,
     #[serde(rename = "ampEnabled", default = "default_true")]
     amp_enabled: bool,
+    // ACU Bridge — per-channel two-way interop leg (e.g. JPS ACU/RSP-Z2) that is
+    // mixed into the primary call, not just a passive recorder mirror like A-MP.
+    #[serde(rename = "bridgeIp", default = "default_amp_ip")]
+    bridge_ip: String,
+    #[serde(rename = "bridgePort", default)]
+    bridge_port: u16,
+    #[serde(rename = "bridgeEnabled", default)]
+    bridge_enabled: bool,
+    // Fixed local UDP port the ACU peer should be configured to send its RTP to.
+    // None = ephemeral (auto-assigned each call, won't be stable across calls).
+    #[serde(rename = "bridgeLocalPort", default)]
+    bridge_local_port: Option<u16>,
 }
 
 fn default_amp_ip() -> String {
@@ -75,6 +87,54 @@ fn default_amp_ip() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+/// Dispatcher — an internal N-way patch group. Members are Aquilla channels
+/// that already each have their own live call (SIP or RTP); while patched,
+/// every member hears + can talk to every other active member, on top of
+/// their own primary call. Optionally, the whole group's audio can also be
+/// mirrored out over RTP to an external destination (same idea as A-MP/ACU
+/// Bridge, but at the group level — see DISPATCHER_IMPLEMENTATION_SUMMARY.md).
+///
+/// v1 supports a fixed number of group slots (`DISPATCH_GROUP_COUNT`) rather
+/// than a dynamically growable list, to keep the /config UI and form parsing
+/// simple. Raise the constant to add more slots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DispatchGroup {
+    id: u32,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "memberIds", default)]
+    member_ids: Vec<u32>,
+    #[serde(rename = "mirrorEnabled", default)]
+    mirror_enabled: bool,
+    #[serde(rename = "mirrorIp", default = "default_amp_ip")]
+    mirror_ip: String,
+    #[serde(rename = "mirrorPort", default)]
+    mirror_port: u16,
+    // Fixed local UDP port the external party (e.g. an ACU Z2 headset resource)
+    // should be configured to send its RTP to, so it can talk back into the
+    // whole patch — same idea as Channel.bridge_local_port for the ACU Bridge.
+    // None = ephemeral (auto-assigned, not stable, external party can't be told
+    // a fixed destination). See `get_or_create_dispatch_mirror`.
+    #[serde(rename = "mirrorLocalPort", default)]
+    mirror_local_port: Option<u16>,
+}
+
+const DISPATCH_GROUP_COUNT: u32 = 4;
+
+fn default_dispatch_groups() -> Vec<DispatchGroup> {
+    (1..=DISPATCH_GROUP_COUNT)
+        .map(|id| DispatchGroup {
+            id,
+            name: format!("Patch {}", ((b'A' + (id as u8 - 1)) as char)),
+            member_ids: Vec::new(),
+            mirror_enabled: false,
+            mirror_ip: "127.0.0.1".to_string(),
+            mirror_port: 9004 + (id as u16 - 1) * 2,
+            mirror_local_port: None,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +147,12 @@ struct GatewayConfig {
     // A-MP global master enable
     #[serde(rename = "ampEnabled", default = "default_true")]
     amp_enabled: bool,
+    // ACU Bridge global master enable
+    #[serde(rename = "bridgeEnabled", default = "default_true")]
+    bridge_enabled: bool,
+    // Dispatcher patch groups
+    #[serde(rename = "dispatchGroups", default = "default_dispatch_groups")]
+    dispatch_groups: Vec<DispatchGroup>,
 }
 
 /// Get the path to the SQLite database in the OS app data directory.
@@ -143,6 +209,24 @@ fn init_db(conn: &Connection) {
     let _ = conn.execute("ALTER TABLE channels ADD COLUMN amp_enabled INTEGER NOT NULL DEFAULT 1", []);
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('amp_enabled', 'true')", []).ok();
 
+    // ACU Bridge columns — a two-way interop leg (e.g. JPS ACU/RSP-Z2) mixed into
+    // the live call, distinct from the one-way A-MP recorder mirror above.
+    let _ = conn.execute("ALTER TABLE channels ADD COLUMN bridge_ip TEXT NOT NULL DEFAULT '127.0.0.1'", []);
+    let bridge_port_added = conn
+        .execute("ALTER TABLE channels ADD COLUMN bridge_port INTEGER NOT NULL DEFAULT 0", [])
+        .is_ok();
+    if bridge_port_added {
+        // Seed a range that doesn't collide with the A-MP default ports (5004, 5006, ...).
+        let _ = conn.execute("UPDATE channels SET bridge_port = 6004 + (id - 1) * 2 WHERE bridge_port = 0", []);
+    }
+    // Per-channel bridge is opt-in (default off) since, unlike A-MP, it's a live
+    // two-way leg mixed into the call rather than a passive recording tap.
+    let _ = conn.execute("ALTER TABLE channels ADD COLUMN bridge_enabled INTEGER NOT NULL DEFAULT 0", []);
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('bridge_enabled', 'true')", []).ok();
+    // Fixed local UDP port to bind the bridge socket to, so the ACU peer can be
+    // configured with a stable destination (nullable = ephemeral/auto).
+    let _ = conn.execute("ALTER TABLE channels ADD COLUMN bridge_local_port INTEGER", []);
+
     // Ensure we have a default/auto-generated API key, SIP auth credentials, and admin login password
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sip_auth_password', 'securepass123')", []).ok();
     
@@ -196,9 +280,25 @@ fn load_config() -> GatewayConfig {
         })
         .unwrap_or(true);
 
+    let bridge_enabled: bool = conn
+        .query_row("SELECT value FROM settings WHERE key = 'bridge_enabled'", [], |row| {
+            let v: String = row.get(0)?;
+            Ok(v != "false" && v != "0")
+        })
+        .unwrap_or(true);
+
+    // Dispatcher patch groups are stored as a single JSON blob (a fixed-size list,
+    // not per-channel, so a settings row is simpler than a new relational table).
+    let dispatch_groups: Vec<DispatchGroup> = conn
+        .query_row("SELECT value FROM settings WHERE key = 'dispatch_groups'", [], |row| {
+            let v: String = row.get(0)?;
+            Ok(serde_json::from_str::<Vec<DispatchGroup>>(&v).unwrap_or_else(|_| default_dispatch_groups()))
+        })
+        .unwrap_or_else(|_| default_dispatch_groups());
+
     // Load channels (still read is_conference column for backward compat but ignore it)
     let mut stmt = conn.prepare(
-        "SELECT id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled FROM channels ORDER BY id"
+        "SELECT id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port FROM channels ORDER BY id"
     ).unwrap();
 
     let channels: Vec<ChannelConfig> = stmt.query_map([], |row| {
@@ -218,6 +318,10 @@ fn load_config() -> GatewayConfig {
             amp_ip: row.get::<_, String>(12).unwrap_or_else(|_| default_amp_ip()),
             amp_port: row.get::<_, u32>(13).unwrap_or(0) as u16,
             amp_enabled: row.get::<_, i32>(14).unwrap_or(1) != 0,
+            bridge_ip: row.get::<_, String>(15).unwrap_or_else(|_| default_amp_ip()),
+            bridge_port: row.get::<_, u32>(16).unwrap_or(0) as u16,
+            bridge_enabled: row.get::<_, i32>(17).unwrap_or(0) != 0,
+            bridge_local_port: row.get::<_, Option<u32>>(18).unwrap_or(None).map(|v| v as u16),
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -233,6 +337,8 @@ fn load_config() -> GatewayConfig {
         selected_device,
         channels,
         amp_enabled,
+        bridge_enabled,
+        dispatch_groups,
     }
 }
 
@@ -263,12 +369,22 @@ fn save_config(config: &GatewayConfig) {
         [if config.amp_enabled { "true" } else { "false" }],
     ).ok();
 
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('bridge_enabled', ?1)",
+        [if config.bridge_enabled { "true" } else { "false" }],
+    ).ok();
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('dispatch_groups', ?1)",
+        [serde_json::to_string(&config.dispatch_groups).unwrap_or_else(|_| "[]".to_string())],
+    ).ok();
+
     // Save channels in a transaction
     conn.execute("BEGIN", []).ok();
     for ch in &config.channels {
         conn.execute(
-            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             rusqlite::params![
                 ch.id,
                 ch.label,
@@ -284,6 +400,10 @@ fn save_config(config: &GatewayConfig) {
                 ch.amp_ip,
                 ch.amp_port as u32,
                 ch.amp_enabled as i32,
+                ch.bridge_ip,
+                ch.bridge_port as u32,
+                ch.bridge_enabled as i32,
+                ch.bridge_local_port.map(|v| v as u32),
             ],
         ).ok();
     }
@@ -338,16 +458,28 @@ fn save_config_to_conn(conn: &Connection, config: &GatewayConfig) {
         [if config.amp_enabled { "true" } else { "false" }],
     ).ok();
 
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('bridge_enabled', ?1)",
+        [if config.bridge_enabled { "true" } else { "false" }],
+    ).ok();
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('dispatch_groups', ?1)",
+        [serde_json::to_string(&config.dispatch_groups).unwrap_or_else(|_| "[]".to_string())],
+    ).ok();
+
     for ch in &config.channels {
         conn.execute(
-            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             rusqlite::params![
                 ch.id, ch.label, ch.protocol, ch.target_ip,
                 ch.target_port as u32, ch.sip_user, ch.codec,
                 ch.local_port.map(|v| v as u32),
                 ch.volume, ch.srtp_enabled as i32, ch.sip_auth_required as i32,
                 ch.amp_ip, ch.amp_port as u32, ch.amp_enabled as i32,
+                ch.bridge_ip, ch.bridge_port as u32, ch.bridge_enabled as i32,
+                ch.bridge_local_port.map(|v| v as u32),
             ],
         ).ok();
     }
@@ -370,6 +502,10 @@ fn default_config() -> GatewayConfig {
             amp_ip: "127.0.0.1".to_string(),
             amp_port: 5004 + (id as u16 - 1) * 2,
             amp_enabled: true,
+            bridge_ip: "127.0.0.1".to_string(),
+            bridge_port: 6004 + (id as u16 - 1) * 2,
+            bridge_enabled: false,
+            bridge_local_port: None,
         })
         .collect();
 
@@ -378,6 +514,8 @@ fn default_config() -> GatewayConfig {
         selected_device: None,
         channels,
         amp_enabled: true,
+        bridge_enabled: true,
+        dispatch_groups: default_dispatch_groups(),
     }
 }
 
@@ -425,6 +563,22 @@ struct Channel {
     amp_streaming: bool,
     #[serde(rename = "ampEnabled")]
     amp_enabled: bool,
+    #[serde(rename = "bridgeIp")]
+    bridge_ip: String,
+    #[serde(rename = "bridgePort")]
+    bridge_port: u16,
+    #[serde(rename = "bridgeEnabled")]
+    bridge_enabled: bool,
+    #[serde(rename = "bridgeLocalPort")]
+    bridge_local_port: Option<u16>,
+    /// Runtime status: true while a live two-way ACU bridge leg is up for this call.
+    #[serde(rename = "bridgeConnected")]
+    bridge_connected: bool,
+    /// Runtime status: true while this channel is an active Dispatcher patch member
+    /// (i.e. it's on a live call AND at least one other member of one of its
+    /// Dispatcher groups is also on a live call).
+    #[serde(rename = "dispatchConnected")]
+    dispatch_connected: bool,
     #[serde(skip)]
     secure_context: Arc<tokio::sync::Mutex<crypto::SecureChannelContext>>,
     #[serde(skip)]
@@ -459,6 +613,8 @@ struct ActiveCall {
     rtp_abort_handle: Option<tokio::task::AbortHandle>,
     rtp_rx_abort_handle: Option<tokio::task::AbortHandle>,
     sip_abort_handle: Option<tokio::task::AbortHandle>,
+    bridge_abort_handle: Option<tokio::task::AbortHandle>,
+    dispatch_abort_handles: Vec<tokio::task::AbortHandle>,
 }
 
 // Request payloads
@@ -482,6 +638,27 @@ struct AppState {
     selected_device: Option<String>,
     sip_port: u16,
     amp_enabled: bool,
+    bridge_enabled: bool,
+    dispatch_groups: Vec<DispatchGroup>,
+    /// Runtime-only fan-out buses for active Dispatcher groups, keyed by group id.
+    /// Created lazily the first time a member of that group needs it.
+    dispatch_buses: HashMap<u32, broadcast::Sender<DispatchFrame>>,
+    /// The ONE shared two-way mirror tap per Dispatcher group (not one per
+    /// member — every member's outgoing audio goes through the same tap so the
+    /// external party hears one combined patch feed, and whatever it sends back
+    /// is republished onto the group's bus for every member to pick up). Created
+    /// lazily on first use; invalidated (cleared) whenever config is saved so a
+    /// changed ip/port/local-port takes effect on the next connecting member.
+    dispatch_mirror_taps: HashMap<u32, Arc<RecordingTap>>,
+    /// Abort handle for each group's mirror RX listener task, paired 1:1 with
+    /// `dispatch_mirror_taps`.
+    dispatch_mirror_listeners: HashMap<u32, tokio::task::AbortHandle>,
+    /// Live, instantly-toggleable membership flags for every currently
+    /// connected (channel_id, group_id) pair — see `DispatchOut`. The matrix
+    /// toggle endpoint flips these directly so a patch change takes effect on
+    /// the very next audio frame, with no reconnect/respawn needed. Entries
+    /// are (re)created fresh at connect time and removed at teardown.
+    dispatch_membership_flags: HashMap<(u32, u32), Arc<std::sync::atomic::AtomicBool>>,
 }
 
 fn save_state_to_file(state: &AppState) {
@@ -500,6 +677,10 @@ fn save_state_to_file(state: &AppState) {
         amp_ip: ch.amp_ip.clone(),
         amp_port: ch.amp_port,
         amp_enabled: ch.amp_enabled,
+        bridge_ip: ch.bridge_ip.clone(),
+        bridge_port: ch.bridge_port,
+        bridge_enabled: ch.bridge_enabled,
+        bridge_local_port: ch.bridge_local_port,
     }).collect();
 
     let config = GatewayConfig {
@@ -507,6 +688,8 @@ fn save_state_to_file(state: &AppState) {
         selected_device: state.selected_device.clone(),
         channels: channel_configs,
         amp_enabled: state.amp_enabled,
+        bridge_enabled: state.bridge_enabled,
+        dispatch_groups: state.dispatch_groups.clone(),
     };
 
     save_config(&config);
@@ -1163,18 +1346,30 @@ impl RecordingTap {
     }
 }
 
-/// Build a recording tap from already-resolved A-MP settings. Takes plain params
-/// (never locks AppState) so it is safe to call from a site that already holds
-/// the state lock — avoiding tokio Mutex re-entrancy deadlocks. Returns None if
-/// A-MP is disabled, the port is unset, or the mirror socket can't be created.
-async fn build_recording_tap(enabled: bool, ip: &str, port: u16, channel_id: u32) -> Option<Arc<RecordingTap>> {
+/// Build a recording tap from already-resolved A-MP (or ACU Bridge) settings.
+/// Takes plain params (never locks AppState) so it is safe to call from a site
+/// that already holds the state lock — avoiding tokio Mutex re-entrancy
+/// deadlocks. Returns None if disabled, the port is unset, or the socket can't
+/// be created.
+///
+/// `local_port`: None binds an ephemeral port (fine for A-MP, which is a
+/// receive-only recorder that never needs to be dialed back). Some(p) binds a
+/// fixed local port instead — required for the ACU Bridge leg, since the ACU
+/// peer needs a stable, known destination port on this console to send its
+/// own RTP to (see ACU_BRIDGE_IMPLEMENTATION_SUMMARY.md).
+async fn build_recording_tap(enabled: bool, ip: &str, port: u16, channel_id: u32, local_port: Option<u16>) -> Option<Arc<RecordingTap>> {
     if !enabled || port == 0 || ip.trim().is_empty() {
         return None;
     }
-    match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+    let bind_addr = match local_port {
+        Some(p) => format!("0.0.0.0:{}", p),
+        None => "0.0.0.0:0".to_string(),
+    };
+    match tokio::net::UdpSocket::bind(&bind_addr).await {
         Ok(sock) => {
             let dest = format!("{}:{}", ip, port);
-            println!("[A-MP] Channel {} mirroring call audio to {}", channel_id, dest);
+            let actual_local_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+            println!("[A-MP/Bridge] Channel {} mirroring call audio to {} (local port {})", channel_id, dest, actual_local_port);
             Some(Arc::new(RecordingTap {
                 socket: Arc::new(sock),
                 dest,
@@ -1184,7 +1379,7 @@ async fn build_recording_tap(enabled: bool, ip: &str, port: u16, channel_id: u32
             }))
         }
         Err(e) => {
-            eprintln!("[A-MP] Failed to open mirror socket for channel {}: {}", channel_id, e);
+            eprintln!("[A-MP/Bridge] Failed to open mirror socket for channel {} (bind {}): {}", channel_id, bind_addr, e);
             None
         }
     }
@@ -1203,6 +1398,379 @@ async fn amp_settings_for(state: &Arc<Mutex<AppState>>, channel_id: u32) -> (boo
     )
 }
 
+/// Same as `amp_settings_for` but for the ACU Bridge leg. Also resolves the
+/// fixed local bind port (falling back to `8004 + (id-1)*2` if unset) so the
+/// ACU peer can be given a stable destination. Convenience for call sites that
+/// do NOT already hold the state lock.
+async fn bridge_settings_for(state: &Arc<Mutex<AppState>>, channel_id: u32) -> (bool, String, u16, u16) {
+    let lock = state.lock().await;
+    let ch = lock.channels.iter().find(|c| c.id == channel_id);
+    (
+        lock.bridge_enabled && ch.map(|c| c.bridge_enabled).unwrap_or(false),
+        ch.map(|c| c.bridge_ip.clone()).unwrap_or_else(|| "127.0.0.1".to_string()),
+        ch.map(|c| c.bridge_port).unwrap_or(0),
+        ch.and_then(|c| c.bridge_local_port).unwrap_or(8004 + (channel_id as u16 - 1) * 2),
+    )
+}
+
+/// Overlay a secondary mono audio source onto an already primary-filled output
+/// buffer (interleaved by `channels`). Used to mix the ACU Bridge leg's decoded
+/// audio into local speaker output alongside the primary (jitter-buffered) call
+/// audio. Best-effort: pops silence when the secondary queue is empty instead of
+/// stalling — only the primary path gets full adaptive jitter-buffer/underrun
+/// handling; the bridge leg is a secondary, lower-priority audio source.
+fn overlay_secondary_mono(buf: &mut [f32], secondary: &std::sync::Mutex<std::collections::VecDeque<f32>>, channels: usize) {
+    if channels == 0 {
+        return;
+    }
+    let mut q = secondary.lock().unwrap();
+    for frame in buf.chunks_mut(channels) {
+        let s = q.pop_front().unwrap_or(0.0);
+        if s == 0.0 {
+            continue;
+        }
+        for out in frame.iter_mut() {
+            *out = (*out + s).clamp(-1.0, 1.0);
+        }
+    }
+}
+
+/// Two-way ACU Bridge leg: receives RTP/PCMU from a secondary interop endpoint
+/// (e.g. a JPS ACU/RSP-Z2 attached to another radio/console), and:
+///   1. mixes the decoded audio into the local speaker output via `acu_queue`
+///      (overlaid on top of the primary jitter-buffered audio in
+///      `start_audio_playback`'s cpal output callback), and
+///   2. re-encodes it as an independent RTP/PCMU stream (its own SSRC) and
+///      forwards it to the primary call's target (e.g. JPS MCC), so the ACU
+///      party is heard on both ends of the primary call — a real 3-way patch,
+///      not just a passive recording tap.
+///
+/// Caveat (see ACU_BRIDGE_IMPLEMENTATION_SUMMARY.md): step 2 sends a *second*
+/// RTP SSRC to the primary target rather than sample-mixing into the operator's
+/// own encoded TX stream. This keeps the existing, safety-critical PTT-gated
+/// mic path completely untouched. Most interop gateways (including JPS
+/// hardware) handle multiple inbound SSRCs natively; if the far end strictly
+/// expects a single SSRC, only the most recently active source may be audible.
+fn start_bridge_listener(
+    channel_id: u32,
+    bridge_socket: Arc<tokio::net::UdpSocket>,
+    primary_rtp_socket: Arc<tokio::net::UdpSocket>,
+    primary_rtp_dest: String,
+    acu_queue: Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>,
+    out_sample_rate: u32,
+) -> tokio::task::AbortHandle {
+    let task = tokio::spawn(async move {
+        let mut resampler_out = PlaybackResampler::new(8000, out_sample_rate);
+        let mut limiter = AudioLimiter::new();
+        let mut buf = [0u8; 2048];
+        let fwd_ssrc = rand_u32();
+        let mut fwd_seq: u16 = rand_u32() as u16;
+        let mut fwd_ts: u32 = rand_u32();
+        let max_queue_samples = (out_sample_rate as usize) * 500 / 1000; // cap at 500ms, matches primary jitter buffer ceiling
+
+        println!("[ACU Bridge] Channel {} bridge RX task active (forwarding to {})", channel_id, primary_rtp_dest);
+
+        loop {
+            match bridge_socket.recv_from(&mut buf).await {
+                Ok((len, _src)) => {
+                    if len < 12 {
+                        continue;
+                    }
+                    let version = (buf[0] >> 6) & 0x03;
+                    let payload_type = buf[1] & 0x7F;
+                    if version != 2 || payload_type != 0 {
+                        continue;
+                    }
+                    let payload = match parse_rtp_payload(&buf[..len]) {
+                        Some(p) if !p.is_empty() => p.to_vec(),
+                        _ => continue,
+                    };
+
+                    // Decode + clean up for local playback
+                    let mut pcm: Vec<i16> = payload.iter().map(|&b| ulaw_to_linear(b)).collect();
+                    limiter.process(&mut pcm);
+
+                    // 1. Mix into the local speaker (best-effort overlay, see start_audio_playback)
+                    let mut upsampled = Vec::new();
+                    resampler_out.process(&pcm, &mut upsampled);
+                    if !upsampled.is_empty() {
+                        let mut q = acu_queue.lock().unwrap();
+                        q.extend(upsampled);
+                        if q.len() > max_queue_samples {
+                            let excess = q.len() - max_queue_samples;
+                            q.drain(..excess);
+                        }
+                    }
+
+                    // 2. Forward to the primary call's target as an independent RTP/PCMU stream
+                    let mut packet = vec![0u8; 12 + payload.len()];
+                    packet[0] = 0x80;
+                    packet[1] = 0x00;
+                    packet[2] = (fwd_seq >> 8) as u8;
+                    packet[3] = (fwd_seq & 0xFF) as u8;
+                    packet[4..8].copy_from_slice(&fwd_ts.to_be_bytes());
+                    packet[8..12].copy_from_slice(&fwd_ssrc.to_be_bytes());
+                    packet[12..].copy_from_slice(&payload);
+                    let _ = primary_rtp_socket.send_to(&packet, &primary_rtp_dest).await;
+                    fwd_seq = fwd_seq.wrapping_add(1);
+                    fwd_ts = fwd_ts.wrapping_add(payload.len() as u32);
+                }
+                Err(e) => {
+                    println!("[ACU Bridge] Channel {} bridge socket closed: {}", channel_id, e);
+                    break;
+                }
+            }
+        }
+    });
+    task.abort_handle()
+}
+
+// ============================================================================
+// DISPATCHER — internal N-way patch groups.
+// Members are Aquilla channels that already each have their own live call; a
+// group's broadcast bus fans out every member's audio (µ-law frames tagged
+// with the source channel id) to every other member, in-process (no sockets).
+// Each member independently mixes what it receives into its own local speaker
+// output and forwards it to its own primary target — the same mixing/forward
+// pattern the ACU Bridge uses, just sourced from an in-process bus instead of
+// a UDP socket. See DISPATCHER_IMPLEMENTATION_SUMMARY.md for the full design
+// and trade-offs.
+// ============================================================================
+
+/// One frame published onto a Dispatcher group's bus.
+#[derive(Debug, Clone)]
+struct DispatchFrame {
+    source_channel_id: u32,
+    ulaw: Vec<u8>,
+}
+
+/// Which group ids (if any) a channel currently belongs to.
+fn dispatch_group_ids_for(groups: &[DispatchGroup], channel_id: u32) -> Vec<u32> {
+    groups.iter().filter(|g| g.member_ids.contains(&channel_id)).map(|g| g.id).collect()
+}
+
+/// Get (or lazily create) the broadcast bus for a Dispatcher group. Takes
+/// `&mut AppState` directly (synchronous, no lock re-entry) so it's safe to
+/// call from sites that already hold the state lock.
+fn get_or_create_dispatch_bus(state: &mut AppState, group_id: u32) -> broadcast::Sender<DispatchFrame> {
+    state.dispatch_buses
+        .entry(group_id)
+        .or_insert_with(|| broadcast::channel::<DispatchFrame>(200).0)
+        .clone()
+}
+
+/// Get (or lazily create) the ONE shared two-way mirror tap for a Dispatcher
+/// group, plus its RX listener task. Unlike per-channel A-MP/ACU Bridge taps
+/// (one per call), a group's mirror is a single shared resource: every
+/// member's outgoing audio goes through the same tap (so the external party —
+/// e.g. an ACU Z2 headset resource — hears one combined patch feed instead of
+/// N separate streams), and anything that external party sends back is
+/// decoded once by the listener and republished onto the group's bus tagged
+/// with a sentinel `source_channel_id: 0` (never a real channel id), so every
+/// current member's existing relay task (`start_dispatch_relay`) picks it up
+/// exactly like another member's audio. This is what makes the mirror a real
+/// two-way leg instead of a passive recording tap — the same idea as the ACU
+/// Bridge, just shared across the whole group instead of tied to one call.
+///
+/// Takes `&mut AppState` and is itself `async` (the tap's socket bind is
+/// async); safe to call from sites that already hold the state lock, same as
+/// every other tap-building call site in this file (tokio::sync::Mutex is
+/// fine to hold across an await).
+async fn get_or_create_dispatch_mirror(state: &mut AppState, group_id: u32) -> Option<Arc<RecordingTap>> {
+    if let Some(tap) = state.dispatch_mirror_taps.get(&group_id) {
+        return Some(Arc::clone(tap));
+    }
+    let group = state.dispatch_groups.iter().find(|g| g.id == group_id)?.clone();
+    if !group.mirror_enabled || group.mirror_port == 0 || group.mirror_ip.trim().is_empty() {
+        return None;
+    }
+    let local_port = group.mirror_local_port.unwrap_or(11004 + (group_id as u16 - 1) * 2);
+    let tap = build_recording_tap(true, &group.mirror_ip, group.mirror_port, group_id, Some(local_port)).await?;
+    let bus = get_or_create_dispatch_bus(state, group_id);
+    let listener = start_dispatch_mirror_listener(group_id, Arc::clone(&tap.socket), bus);
+    state.dispatch_mirror_taps.insert(group_id, Arc::clone(&tap));
+    state.dispatch_mirror_listeners.insert(group_id, listener);
+    Some(tap)
+}
+
+/// Listens for RTP/PCMU sent back from the external party on a Dispatcher
+/// group's shared mirror tap, decodes it, and republishes it onto the
+/// group's bus (sentinel `source_channel_id: 0`) so every current member
+/// mixes it into their own speaker and forwards it to their own primary RTP
+/// target via their existing relay task. See `get_or_create_dispatch_mirror`.
+fn start_dispatch_mirror_listener(
+    group_id: u32,
+    mirror_socket: Arc<tokio::net::UdpSocket>,
+    bus: broadcast::Sender<DispatchFrame>,
+) -> tokio::task::AbortHandle {
+    let task = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        println!("[Dispatcher] Group {} mirror RX task active", group_id);
+        loop {
+            match mirror_socket.recv_from(&mut buf).await {
+                Ok((len, _src)) => {
+                    if len < 12 {
+                        continue;
+                    }
+                    let version = (buf[0] >> 6) & 0x03;
+                    let payload_type = buf[1] & 0x7F;
+                    if version != 2 || payload_type != 0 {
+                        continue;
+                    }
+                    let payload = match parse_rtp_payload(&buf[..len]) {
+                        Some(p) if !p.is_empty() => p.to_vec(),
+                        _ => continue,
+                    };
+                    let _ = bus.send(DispatchFrame { source_channel_id: 0, ulaw: payload });
+                }
+                Err(e) => {
+                    println!("[Dispatcher] Group {} mirror socket closed: {}", group_id, e);
+                    break;
+                }
+            }
+        }
+    });
+    task.abort_handle()
+}
+
+/// A channel's resolved Dispatcher fan-out for ONE group: the group's bus,
+/// that group's ONE shared mirror tap if configured (see
+/// `get_or_create_dispatch_mirror`), and a live, instantly-toggleable
+/// membership flag.
+///
+/// For "instant, no save/reload" emergency patching, every connected channel
+/// is ALWAYS linked to all `DISPATCH_GROUP_COUNT` groups (a relay task
+/// running for each, and TX/RX always able to publish to each bus) — nothing
+/// is spawned or torn down when membership changes. Instead, `is_member`
+/// (shared via `AppState.dispatch_membership_flags`) is checked on every
+/// frame; the matrix toggle endpoint just flips this atomic, so a patch
+/// takes effect on the very next audio frame for calls already in progress,
+/// with no reconnect needed.
+#[derive(Clone)]
+struct DispatchOut {
+    group_id: u32,
+    bus: broadcast::Sender<DispatchFrame>,
+    mirror_tap: Option<Arc<RecordingTap>>,
+    is_member: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Get (or create) the live membership flag for (channel_id, group_id),
+/// seeded from `initial`, and register it in `AppState.dispatch_membership_flags`
+/// so the matrix toggle endpoint can find and flip it instantly for a channel
+/// that's currently connected. Always creates a fresh flag at connect time
+/// (overwriting any stale leftover from a previous call) so it reflects
+/// current config at the moment of connecting.
+fn register_dispatch_membership_flag(state: &mut AppState, channel_id: u32, group_id: u32, initial: bool) -> Arc<std::sync::atomic::AtomicBool> {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(initial));
+    state.dispatch_membership_flags.insert((channel_id, group_id), Arc::clone(&flag));
+    flag
+}
+
+/// Resolve all `DISPATCH_GROUP_COUNT` DispatchOuts for a connecting channel
+/// (always all groups, not just its current members — see `DispatchOut`).
+/// Convenience for call sites that do NOT already hold the state lock
+/// (mirrors `bridge_settings_for`).
+async fn dispatch_outs_for(state: &Arc<Mutex<AppState>>, channel_id: u32) -> Vec<DispatchOut> {
+    let mut lock = state.lock().await;
+    dispatch_outs_for_locked(&mut lock, channel_id).await
+}
+
+/// Same as `dispatch_outs_for` but for call sites that already hold the state
+/// lock (a `tokio::sync::MutexGuard` derefs to `&mut AppState`).
+async fn dispatch_outs_for_locked(state: &mut AppState, channel_id: u32) -> Vec<DispatchOut> {
+    let mut outs = Vec::new();
+    for gid in 1..=DISPATCH_GROUP_COUNT {
+        let is_member_now = state.dispatch_groups.iter()
+            .find(|g| g.id == gid)
+            .map(|g| g.member_ids.contains(&channel_id))
+            .unwrap_or(false);
+        let is_member = register_dispatch_membership_flag(state, channel_id, gid, is_member_now);
+        let bus = get_or_create_dispatch_bus(state, gid);
+        let mirror_tap = get_or_create_dispatch_mirror(state, gid).await;
+        outs.push(DispatchOut { group_id: gid, bus, mirror_tap, is_member });
+    }
+    outs
+}
+
+/// One relay per Dispatcher group a channel belongs to. Subscribes to that
+/// group's bus and, for every frame from a *different* channel:
+///   1. mixes it into the local speaker (via `dispatch_queue`, overlaid the
+///      same way `acu_queue` is for the ACU Bridge), and
+///   2. re-encodes it and forwards it to this channel's own primary target as
+///      an independent RTP/PCMU stream (own SSRC — same trade-off as the ACU
+///      Bridge's forwarding).
+/// Frames this channel itself published are skipped so it never hears/forwards
+/// its own audio back to itself.
+fn start_dispatch_relay(
+    channel_id: u32,
+    mut rx: broadcast::Receiver<DispatchFrame>,
+    primary_rtp_socket: Arc<tokio::net::UdpSocket>,
+    primary_rtp_dest: String,
+    dispatch_queue: Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>,
+    out_sample_rate: u32,
+    is_member: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::AbortHandle {
+    let task = tokio::spawn(async move {
+        let mut resampler_out = PlaybackResampler::new(8000, out_sample_rate);
+        let mut limiter = AudioLimiter::new();
+        let fwd_ssrc = rand_u32();
+        let mut fwd_seq: u16 = rand_u32() as u16;
+        let mut fwd_ts: u32 = rand_u32();
+        let max_queue_samples = (out_sample_rate as usize) * 500 / 1000;
+
+        println!("[Dispatcher] Channel {} patch relay active (forwarding to {})", channel_id, primary_rtp_dest);
+
+        loop {
+            match rx.recv().await {
+                Ok(frame) => {
+                    if frame.source_channel_id == channel_id || frame.ulaw.is_empty() {
+                        continue;
+                    }
+                    // Live membership gate: even though this relay is always
+                    // running for every group, it only actually mixes/forwards
+                    // while this channel is CURRENTLY toggled into the group —
+                    // this is what makes matrix clicks take effect instantly on
+                    // calls already in progress, with no respawn needed.
+                    if !is_member.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    let mut pcm: Vec<i16> = frame.ulaw.iter().map(|&b| ulaw_to_linear(b)).collect();
+                    limiter.process(&mut pcm);
+
+                    // 1. Mix into the local speaker (best-effort overlay)
+                    let mut upsampled = Vec::new();
+                    resampler_out.process(&pcm, &mut upsampled);
+                    if !upsampled.is_empty() {
+                        let mut q = dispatch_queue.lock().unwrap();
+                        q.extend(upsampled);
+                        if q.len() > max_queue_samples {
+                            let excess = q.len() - max_queue_samples;
+                            q.drain(..excess);
+                        }
+                    }
+
+                    // 2. Forward to this channel's own primary target as an independent RTP/PCMU stream
+                    let mut packet = vec![0u8; 12 + frame.ulaw.len()];
+                    packet[0] = 0x80;
+                    packet[1] = 0x00;
+                    packet[2] = (fwd_seq >> 8) as u8;
+                    packet[3] = (fwd_seq & 0xFF) as u8;
+                    packet[4..8].copy_from_slice(&fwd_ts.to_be_bytes());
+                    packet[8..12].copy_from_slice(&fwd_ssrc.to_be_bytes());
+                    packet[12..].copy_from_slice(&frame.ulaw);
+                    let _ = primary_rtp_socket.send_to(&packet, &primary_rtp_dest).await;
+                    fwd_seq = fwd_seq.wrapping_add(1);
+                    fwd_ts = fwd_ts.wrapping_add(frame.ulaw.len() as u32);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    task.abort_handle()
+}
+
 // Background RTP streaming from local microphone
 fn start_microphone_rtp(
     channel_id: u32,
@@ -1213,6 +1781,8 @@ fn start_microphone_rtp(
     ptt_active: Arc<std::sync::atomic::AtomicBool>,
     call_id: String,
     rec_tap: Option<Arc<RecordingTap>>,
+    bridge_tap: Option<Arc<RecordingTap>>,
+    dispatch_outs: Vec<DispatchOut>,
 ) -> (Arc<std::sync::atomic::AtomicBool>, tokio::task::AbortHandle) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1363,7 +1933,25 @@ fn start_microphone_rtp(
                         if let Some(ref tap) = rec_tap {
                             tap.send_ulaw(&packet[12..]).await;
                         }
-                        
+
+                        // Also mirror to the ACU Bridge leg (e.g. JPS ACU/RSP-Z2), same
+                        // half-duplex sharing as the A-MP tap above.
+                        if let Some(ref tap) = bridge_tap {
+                            tap.send_ulaw(&packet[12..]).await;
+                        }
+
+                        // Publish to any Dispatcher patch groups this channel belongs to
+                        // (fan-out to other members) and their optional external mirror tap.
+                        for d in &dispatch_outs {
+                            if !d.is_member.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            let _ = d.bus.send(DispatchFrame { source_channel_id: channel_id, ulaw: packet[12..].to_vec() });
+                            if let Some(ref tap) = d.mirror_tap {
+                                tap.send_ulaw(&packet[12..]).await;
+                            }
+                        }
+
                         last_tx_time = tokio::time::Instant::now();
                     } else if last_tx_time.elapsed() >= Duration::from_secs(5) {
                         // Send RTP keepalive (empty payload) to maintain Z2 connection
@@ -1556,6 +2144,14 @@ fn start_microphone_rtp(
     (stop_flag, sender_task.abort_handle())
 }
 
+/// Abort handles returned by `start_audio_playback` for every secondary audio
+/// path it may have started, so callers don't need an ever-growing tuple.
+struct PlaybackHandles {
+    rx_abort: tokio::task::AbortHandle,
+    bridge_abort: Option<tokio::task::AbortHandle>,
+    dispatch_aborts: Vec<tokio::task::AbortHandle>,
+}
+
 // Background RTP receiving and playback to local speaker
 fn start_audio_playback(
     channel_id: u32,
@@ -1567,7 +2163,10 @@ fn start_audio_playback(
     call_id: String,
     rec_tap: Option<Arc<RecordingTap>>,
     ptt_active: Arc<std::sync::atomic::AtomicBool>,
-) -> tokio::task::AbortHandle {
+    bridge_tap: Option<Arc<RecordingTap>>,
+    primary_rtp_dest: String,
+    dispatch_outs: Vec<DispatchOut>,
+) -> PlaybackHandles {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::Ordering;
@@ -1592,9 +2191,28 @@ fn start_audio_playback(
     let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
     let queue_clone = Arc::clone(&queue);
     let stop_flag_clone = Arc::clone(&stop_flag);
-    
+
+    // Secondary mono queue fed by the ACU Bridge leg (if enabled), overlaid onto
+    // the primary jitter-buffered output in the cpal callback below.
+    let acu_queue: Option<Arc<Mutex<VecDeque<f32>>>> = if bridge_tap.is_some() {
+        Some(Arc::new(Mutex::new(VecDeque::<f32>::new())))
+    } else {
+        None
+    };
+
+    // Secondary mono queue fed by any Dispatcher patch groups this channel is
+    // in (shared across all of them — see the "multiple groups" caveat in
+    // DISPATCHER_IMPLEMENTATION_SUMMARY.md), overlaid the same way as acu_queue.
+    let dispatch_queue: Option<Arc<Mutex<VecDeque<f32>>>> = if !dispatch_outs.is_empty() {
+        Some(Arc::new(Mutex::new(VecDeque::<f32>::new())))
+    } else {
+        None
+    };
+
     let device_clone = device.clone();
     let config_clone = config.clone();
+    let acu_queue_for_thread = acu_queue.clone();
+    let dispatch_queue_for_thread = dispatch_queue.clone();
 
     {
         // 1. Spawn the CPAL output stream thread with AdaptiveJitterBuffer
@@ -1624,12 +2242,21 @@ fn start_audio_playback(
             let stream = match config.sample_format() {
                 cpal::SampleFormat::F32 => {
                     let q_c = Arc::clone(&queue_clone);
+                    let acu_q = acu_queue_for_thread.clone();
+                    let dispatch_q = dispatch_queue_for_thread.clone();
                     let mut jitter_buf = AdaptiveJitterBuffer::new(out_rate);
                     device.build_output_stream(
                         &config.into(),
                         move |data: &mut [f32], _: &_| {
                             let mut q = q_c.lock().unwrap();
                             jitter_buf.fill_output(&mut q, data, channels);
+                            drop(q);
+                            if let Some(ref aq) = acu_q {
+                                overlay_secondary_mono(data, aq, channels);
+                            }
+                            if let Some(ref dq) = dispatch_q {
+                                overlay_secondary_mono(data, dq, channels);
+                            }
                         },
                         err_fn,
                         None
@@ -1637,6 +2264,8 @@ fn start_audio_playback(
                 }
                 cpal::SampleFormat::I16 => {
                     let q_c = Arc::clone(&queue_clone);
+                    let acu_q = acu_queue_for_thread.clone();
+                    let dispatch_q = dispatch_queue_for_thread.clone();
                     let mut jitter_buf = AdaptiveJitterBuffer::new(out_rate);
                     let mut float_buf = Vec::new();
                     device.build_output_stream(
@@ -1646,6 +2275,12 @@ fn start_audio_playback(
                             {
                                 let mut q = q_c.lock().unwrap();
                                 jitter_buf.fill_output(&mut q, &mut float_buf, channels);
+                            }
+                            if let Some(ref aq) = acu_q {
+                                overlay_secondary_mono(&mut float_buf, aq, channels);
+                            }
+                            if let Some(ref dq) = dispatch_q {
+                                overlay_secondary_mono(&mut float_buf, dq, channels);
                             }
                             for (out, &f) in data.iter_mut().zip(float_buf.iter()) {
                                 *out = (f.clamp(-1.0, 1.0) * 32767.0) as i16;
@@ -1657,6 +2292,8 @@ fn start_audio_playback(
                 }
                 cpal::SampleFormat::U16 => {
                     let q_c = Arc::clone(&queue_clone);
+                    let acu_q = acu_queue_for_thread.clone();
+                    let dispatch_q = dispatch_queue_for_thread.clone();
                     let mut jitter_buf = AdaptiveJitterBuffer::new(out_rate);
                     let mut float_buf = Vec::new();
                     device.build_output_stream(
@@ -1666,6 +2303,12 @@ fn start_audio_playback(
                             {
                                 let mut q = q_c.lock().unwrap();
                                 jitter_buf.fill_output(&mut q, &mut float_buf, channels);
+                            }
+                            if let Some(ref aq) = acu_q {
+                                overlay_secondary_mono(&mut float_buf, aq, channels);
+                            }
+                            if let Some(ref dq) = dispatch_q {
+                                overlay_secondary_mono(&mut float_buf, dq, channels);
                             }
                             for (out, &f) in data.iter_mut().zip(float_buf.iter()) {
                                 *out = ((f.clamp(-1.0, 1.0) * 32767.0) + 32768.0) as u16;
@@ -1705,6 +2348,12 @@ fn start_audio_playback(
     // 2. Spawn the tokio task to receive incoming RTP UDP packets, decode, and route accordingly
     let rtp_socket_clone = Arc::clone(&rtp_socket);
     let queue_write = Arc::clone(&queue);
+    // Cloned so `bridge_tap` itself remains available below (after this async block
+    // moves its own copy in) to spawn the two-way bridge listener.
+    let bridge_tap_rx = bridge_tap.clone();
+    // Cloned so `dispatch_outs` itself remains available below to spawn the
+    // per-group relay tasks after this async block moves its own copy in.
+    let dispatch_outs_rx = dispatch_outs.clone();
 
     let rx_task = tokio::spawn(async move {
         let mut resampler = PlaybackResampler::new(8000, sample_rate);
@@ -1773,6 +2422,32 @@ fn start_audio_playback(
                                     }
                                 }
 
+                                // Also mirror to the ACU Bridge leg, same half-duplex sharing.
+                                if let Some(ref tap) = bridge_tap_rx {
+                                    if !ptt_active.load(std::sync::atomic::Ordering::SeqCst) {
+                                        tap.send_ulaw(&payload).await;
+                                    }
+                                }
+
+                                // Publish the incoming (remote/RX) leg to any Dispatcher patch
+                                // groups this channel belongs to, so other patched channels hear
+                                // this side of the call too. Not gated by PTT: each group member
+                                // publishes independent frames onto its own bus (not a shared
+                                // wire), so there's no TX/RX interleaving hazard here — only the
+                                // optional external mirror tap below reuses the shared-wire
+                                // RecordingTap mechanism and needs the same half-duplex gating.
+                                for d in &dispatch_outs_rx {
+                                    if !d.is_member.load(std::sync::atomic::Ordering::Relaxed) {
+                                        continue;
+                                    }
+                                    let _ = d.bus.send(DispatchFrame { source_channel_id: channel_id, ulaw: payload.clone() });
+                                    if let Some(ref tap) = d.mirror_tap {
+                                        if !ptt_active.load(std::sync::atomic::Ordering::SeqCst) {
+                                            tap.send_ulaw(&payload).await;
+                                        }
+                                    }
+                                }
+
                                 // Decode µ-law to linear i16
                                 let mut pcm: Vec<i16> = payload.iter().map(|&b| ulaw_to_linear(b)).collect();
                                 
@@ -1799,7 +2474,47 @@ fn start_audio_playback(
         }
     });
 
-    rx_task.abort_handle()
+    // 3. If an ACU Bridge tap was built for this call, spawn the two-way bridge
+    // listener on the SAME socket the tap uses to send (so replies from the ACU
+    // peer arrive symmetrically on the port it just saw traffic from).
+    let bridge_abort = if let (Some(tap), Some(aq)) = (bridge_tap.as_ref(), acu_queue.as_ref()) {
+        Some(start_bridge_listener(
+            channel_id,
+            Arc::clone(&tap.socket),
+            Arc::clone(&rtp_socket),
+            primary_rtp_dest.clone(),
+            Arc::clone(aq),
+            sample_rate,
+        ))
+    } else {
+        None
+    };
+
+    // 4. Spawn one relay task per Dispatcher group this channel belongs to,
+    // forwarding what every OTHER member of that group says both into this
+    // channel's local speaker (via dispatch_queue) and onward to this call's
+    // own primary RTP peer as an independent forwarded stream.
+    let dispatch_aborts: Vec<tokio::task::AbortHandle> = if let Some(ref dq) = dispatch_queue {
+        dispatch_outs.iter().map(|d| {
+            start_dispatch_relay(
+                channel_id,
+                d.bus.subscribe(),
+                Arc::clone(&rtp_socket),
+                primary_rtp_dest.clone(),
+                Arc::clone(dq),
+                sample_rate,
+                Arc::clone(&d.is_member),
+            )
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
+    PlaybackHandles {
+        rx_abort: rx_task.abort_handle(),
+        bridge_abort,
+        dispatch_aborts,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1848,6 +2563,132 @@ async fn ptt_toggle_handler(
     }
 
     (StatusCode::OK, Json(serde_json::json!({ "success": true }))).into_response()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DispatchMatrixGroup {
+    id: u32,
+    name: String,
+    #[serde(rename = "memberIds")]
+    member_ids: Vec<u32>,
+    #[serde(rename = "mirrorEnabled")]
+    mirror_enabled: bool,
+    #[serde(rename = "mirrorIp")]
+    mirror_ip: String,
+    #[serde(rename = "mirrorPort")]
+    mirror_port: u16,
+    #[serde(rename = "mirrorLocalPort")]
+    mirror_local_port: Option<u16>,
+}
+
+/// GET: current Dispatcher matrix state (all 4 groups' membership + mirror
+/// settings), for any UI (console app or /config page JS) that needs to fetch
+/// it without a full page reload.
+async fn get_dispatch_matrix_handler(
+    State(state): State<Arc<Mutex<AppState>>>,
+) -> impl IntoResponse {
+    let lock = state.lock().await;
+    let groups: Vec<DispatchMatrixGroup> = lock.dispatch_groups.iter().map(|g| DispatchMatrixGroup {
+        id: g.id,
+        name: g.name.clone(),
+        member_ids: g.member_ids.clone(),
+        mirror_enabled: g.mirror_enabled,
+        mirror_ip: g.mirror_ip.clone(),
+        mirror_port: g.mirror_port,
+        mirror_local_port: g.mirror_local_port,
+    }).collect();
+    (StatusCode::OK, Json(serde_json::json!({ "groups": groups })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DispatchToggleRequest {
+    #[serde(rename = "groupId")]
+    group_id: u32,
+    #[serde(rename = "channelId")]
+    channel_id: u32,
+}
+
+/// POST: instantly patch/unpatch a channel into/out of a Dispatcher group —
+/// no "Apply Configuration"/reload needed, built for quick action in an
+/// emergency. Updates the persisted `member_ids` roster AND, if the channel
+/// is currently on a live call, flips its live `is_member` flag directly so
+/// the change is audible on the very next audio frame (see `DispatchOut` /
+/// `start_dispatch_relay`). Broadcasts a `dispatch_matrix_update` WebSocket
+/// message so every open console/admin view stays in sync.
+async fn dispatch_toggle_handler(
+    State(state): State<Arc<Mutex<AppState>>>,
+    Json(payload): Json<DispatchToggleRequest>,
+) -> impl IntoResponse {
+    let mut lock = state.lock().await;
+
+    if payload.group_id < 1 || payload.group_id > DISPATCH_GROUP_COUNT {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid group id" }))).into_response();
+    }
+    if payload.channel_id < 1 || payload.channel_id > 12 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid channel id" }))).into_response();
+    }
+
+    let now_member = {
+        let group = match lock.dispatch_groups.iter_mut().find(|g| g.id == payload.group_id) {
+            Some(g) => g,
+            None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Group not found" }))).into_response(),
+        };
+        if let Some(pos) = group.member_ids.iter().position(|&c| c == payload.channel_id) {
+            group.member_ids.remove(pos);
+            false
+        } else {
+            group.member_ids.push(payload.channel_id);
+            true
+        }
+    };
+
+    // If this channel is currently connected, flip its live flag immediately
+    // — this is what makes the toggle take effect on a call already in
+    // progress, with no reconnect. If it's not currently connected there's no
+    // flag to flip yet; the roster change above is what `dispatch_outs_for`
+    // will read the next time it connects.
+    if let Some(flag) = lock.dispatch_membership_flags.get(&(payload.channel_id, payload.group_id)) {
+        flag.store(now_member, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Recompute this channel's dispatch_connected indicator from its current
+    // live flags across all 4 groups (only meaningful if it's connected).
+    let any_member_now = (1..=DISPATCH_GROUP_COUNT).any(|gid| {
+        lock.dispatch_membership_flags.get(&(payload.channel_id, gid))
+            .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    });
+    if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == payload.channel_id) {
+        ch.dispatch_connected = any_member_now;
+    }
+
+    save_state_to_file(&lock);
+
+    let groups: Vec<DispatchMatrixGroup> = lock.dispatch_groups.iter().map(|g| DispatchMatrixGroup {
+        id: g.id,
+        name: g.name.clone(),
+        member_ids: g.member_ids.clone(),
+        mirror_enabled: g.mirror_enabled,
+        mirror_ip: g.mirror_ip.clone(),
+        mirror_port: g.mirror_port,
+        mirror_local_port: g.mirror_local_port,
+    }).collect();
+
+    let _ = lock.tx.send(serde_json::json!({
+        "type": "dispatch_matrix_update",
+        "data": { "groups": groups.clone() }
+    }).to_string());
+
+    if let Some(ch) = lock.channels.iter().find(|c| c.id == payload.channel_id) {
+        let _ = lock.tx.send(serde_json::json!({
+            "type": "channel_update",
+            "data": ch
+        }).to_string());
+    }
+
+    println!("[Dispatcher] Channel {} {} Group {}", payload.channel_id, if now_member { "patched into" } else { "unpatched from" }, payload.group_id);
+
+    (StatusCode::OK, Json(serde_json::json!({ "success": true, "isMember": now_member, "groups": groups }))).into_response()
 }
 
 // REST: Accept Incoming Call
@@ -1915,7 +2756,7 @@ async fn accept_call_handler(
              ch_ref.map(|c| c.amp_ip.clone()).unwrap_or_else(|| "127.0.0.1".to_string()),
              ch_ref.map(|c| c.amp_port).unwrap_or(0))
         };
-        let rec_tap = build_recording_tap(amp_en, &amp_ip, amp_port, id).await;
+        let rec_tap = build_recording_tap(amp_en, &amp_ip, amp_port, id, None).await;
         if rec_tap.is_some() {
             let upd = {
                 if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
@@ -1926,15 +2767,52 @@ async fn accept_call_handler(
             if let Some(upd) = upd { let _ = lock.tx.send(upd); }
         }
 
+        // Build the ACU Bridge tap (two-way interop leg), same held-lock pattern as A-MP above.
+        let (bridge_en, bridge_ip, bridge_port, bridge_local_port) = {
+            let ch_ref = lock.channels.iter().find(|c| c.id == id);
+            (lock.bridge_enabled && ch_ref.map(|c| c.bridge_enabled).unwrap_or(false),
+             ch_ref.map(|c| c.bridge_ip.clone()).unwrap_or_else(|| "127.0.0.1".to_string()),
+             ch_ref.map(|c| c.bridge_port).unwrap_or(0),
+             ch_ref.and_then(|c| c.bridge_local_port).unwrap_or(8004 + (id as u16 - 1) * 2))
+        };
+        let bridge_tap = build_recording_tap(bridge_en, &bridge_ip, bridge_port, id, Some(bridge_local_port)).await;
+        if bridge_tap.is_some() {
+            let upd = {
+                if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
+                    ch.bridge_connected = true;
+                    Some(serde_json::json!({ "type": "channel_update", "data": ch }).to_string())
+                } else { None }
+            };
+            if let Some(upd) = upd { let _ = lock.tx.send(upd); }
+        }
+
+        // Build Dispatcher patch outputs (in-process bus + optional external mirror
+        // tap) for every group this channel belongs to, same held-lock pattern as
+        // A-MP/Bridge above.
+        let dispatch_outs = dispatch_outs_for_locked(&mut lock, id).await;
+        if dispatch_outs.iter().any(|d| d.is_member.load(std::sync::atomic::Ordering::Relaxed)) {
+            let upd = {
+                if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
+                    ch.dispatch_connected = true;
+                    Some(serde_json::json!({ "type": "channel_update", "data": ch }).to_string())
+                } else { None }
+            };
+            if let Some(upd) = upd { let _ = lock.tx.send(upd); }
+        }
+
         // Start capture/transmit task
         let dest_rtp = format!("{}:{}", ctx.remote_ip, ctx.remote_rtp_port);
+        let dest_rtp_for_bridge = dest_rtp.clone();
         let (stop_flag, rtp_abort) = start_microphone_rtp(
-            id, Arc::clone(&rtp_socket), dest_rtp, Arc::clone(&state), selected_device, Arc::clone(&ptt_flag), ctx.call_id.clone(), rec_tap.clone()
+            id, Arc::clone(&rtp_socket), dest_rtp, Arc::clone(&state), selected_device, Arc::clone(&ptt_flag), ctx.call_id.clone(), rec_tap.clone(), bridge_tap.clone(), dispatch_outs.clone()
         );
 
         // Start playback task
         let stop_flag_playback = Arc::clone(&stop_flag);
-        let rtp_rx_abort = start_audio_playback(id, Arc::clone(&rtp_socket), Arc::clone(&state), stop_flag_playback, ch_srtp, ch_ctx, ctx.call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_flag));
+        let playback_handles = start_audio_playback(id, Arc::clone(&rtp_socket), Arc::clone(&state), stop_flag_playback, ch_srtp, ch_ctx, ctx.call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_flag), bridge_tap.clone(), dest_rtp_for_bridge, dispatch_outs);
+        let rtp_rx_abort = playback_handles.rx_abort;
+        let bridge_abort = playback_handles.bridge_abort;
+        let dispatch_aborts = playback_handles.dispatch_aborts;
 
         // Bind local SIP socket synchronously so we can keep it alive for the session
         let sip_socket = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap());
@@ -2020,6 +2898,15 @@ async fn accept_call_handler(
                                 if let Some(h) = active.rtp_rx_abort_handle {
                                     h.abort();
                                 }
+                                if let Some(h) = active.bridge_abort_handle {
+                                    h.abort();
+                                }
+                                for h in active.dispatch_abort_handles {
+                                    h.abort();
+                                }
+                                for gid in 1..=DISPATCH_GROUP_COUNT {
+                                    lock_bye.dispatch_membership_flags.remove(&(id, gid));
+                                }
                                 // Send 200 OK back to BYE request
                                 let ok_resp = format!(
                                     "SIP/2.0 200 OK\r\n\
@@ -2035,6 +2922,8 @@ async fn accept_call_handler(
                                 ch_bye.tx_kbps = 0;
                                 ch_bye.audio_level = 0;
                                 ch_bye.amp_streaming = false;
+                                ch_bye.bridge_connected = false;
+                                ch_bye.dispatch_connected = false;
                             }
                             let _ = tx_cb_listen.send(serde_json::json!({
                                 "type": "channel_update",
@@ -2044,7 +2933,9 @@ async fn accept_call_handler(
                                     "pttActive": false,
                                     "txKbps": 0,
                                     "audioLevel": 0,
-                                    "ampStreaming": false
+                                    "ampStreaming": false,
+                                    "bridgeConnected": false,
+                                    "dispatchConnected": false
                                 }
                             }).to_string());
                             break;
@@ -2070,8 +2961,10 @@ async fn accept_call_handler(
             rtp_abort_handle: Some(rtp_abort),
             rtp_rx_abort_handle: Some(rtp_rx_abort),
             sip_abort_handle: Some(sip_listen_task.abort_handle()),
+            bridge_abort_handle: bridge_abort,
+            dispatch_abort_handles: dispatch_aborts,
         });
-        
+
         let log_msg = serde_json::json!({
             "type": "log",
             "data": {
@@ -2106,6 +2999,8 @@ async fn reject_call_handler(
     if let Some(ctx) = ch.incoming_call.take() {
         ch.status = "IDLE".to_string();
         ch.amp_streaming = false;
+        ch.bridge_connected = false;
+        ch.dispatch_connected = false;
 
         let ch_clone = ch.clone();
         let tx = lock.tx.clone();
@@ -2177,7 +3072,16 @@ async fn initiate_call_handler(
         if let Some(h) = active.sip_abort_handle {
             h.abort();
         }
-        
+        if let Some(h) = active.bridge_abort_handle {
+            h.abort();
+        }
+        for h in active.dispatch_abort_handles {
+            h.abort();
+        }
+        for gid in 1..=DISPATCH_GROUP_COUNT {
+            lock.dispatch_membership_flags.remove(&(id, gid));
+        }
+
         let local_ip = active.local_ip.clone();
         let local_sip_port = active.local_sip_port;
         let target_ip = active.target_ip.clone();
@@ -2321,7 +3225,7 @@ async fn initiate_call_handler(
              ch_ref.map(|c| c.amp_ip.clone()).unwrap_or_else(|| "127.0.0.1".to_string()),
              ch_ref.map(|c| c.amp_port).unwrap_or(0))
         };
-        let rec_tap = build_recording_tap(amp_en, &amp_ip, amp_port, id).await;
+        let rec_tap = build_recording_tap(amp_en, &amp_ip, amp_port, id, None).await;
         if rec_tap.is_some() {
             let upd = {
                 if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
@@ -2331,14 +3235,50 @@ async fn initiate_call_handler(
             };
             if let Some(upd) = upd { let _ = lock.tx.send(upd); }
         }
+
+        // ACU Bridge tap — same held-lock pattern as A-MP above.
+        let (bridge_en, bridge_ip, bridge_port, bridge_local_port) = {
+            let ch_ref = lock.channels.iter().find(|c| c.id == id);
+            (lock.bridge_enabled && ch_ref.map(|c| c.bridge_enabled).unwrap_or(false),
+             ch_ref.map(|c| c.bridge_ip.clone()).unwrap_or_else(|| "127.0.0.1".to_string()),
+             ch_ref.map(|c| c.bridge_port).unwrap_or(0),
+             ch_ref.and_then(|c| c.bridge_local_port).unwrap_or(8004 + (id as u16 - 1) * 2))
+        };
+        let bridge_tap = build_recording_tap(bridge_en, &bridge_ip, bridge_port, id, Some(bridge_local_port)).await;
+        if bridge_tap.is_some() {
+            let upd = {
+                if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
+                    ch.bridge_connected = true;
+                    Some(serde_json::json!({ "type": "channel_update", "data": ch }).to_string())
+                } else { None }
+            };
+            if let Some(upd) = upd { let _ = lock.tx.send(upd); }
+        }
+
+        // Dispatcher patch outputs — same held-lock pattern as A-MP/Bridge above.
+        let dispatch_outs = dispatch_outs_for_locked(&mut lock, id).await;
+        if dispatch_outs.iter().any(|d| d.is_member.load(std::sync::atomic::Ordering::Relaxed)) {
+            let upd = {
+                if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
+                    ch.dispatch_connected = true;
+                    Some(serde_json::json!({ "type": "channel_update", "data": ch }).to_string())
+                } else { None }
+            };
+            if let Some(upd) = upd { let _ = lock.tx.send(upd); }
+        }
+
+        let rtp_dest_for_bridge = rtp_dest.clone();
         let (audio_flag, rtp_task) = start_microphone_rtp(
-            id, Arc::clone(&rtp_sock_task), rtp_dest, Arc::clone(&state_audio), selected_device, ptt_active_flag, call_id.clone(), rec_tap.clone()
+            id, Arc::clone(&rtp_sock_task), rtp_dest, Arc::clone(&state_audio), selected_device, ptt_active_flag, call_id.clone(), rec_tap.clone(), bridge_tap.clone(), dispatch_outs.clone()
         );
 
         let audio_flag_playback = Arc::clone(&audio_flag);
-        let rtp_rx_task = start_audio_playback(
-            id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_active_flag_clone)
+        let playback_handles = start_audio_playback(
+            id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_active_flag_clone), bridge_tap.clone(), rtp_dest_for_bridge, dispatch_outs
         );
+        let rtp_rx_task = playback_handles.rx_abort;
+        let bridge_abort = playback_handles.bridge_abort;
+        let dispatch_aborts = playback_handles.dispatch_aborts;
 
         let active_call = ActiveCall {
             channel_id: id,
@@ -2355,6 +3295,8 @@ async fn initiate_call_handler(
             rtp_abort_handle: Some(rtp_task),
             rtp_rx_abort_handle: Some(rtp_rx_task),
             sip_abort_handle: None,
+            bridge_abort_handle: bridge_abort,
+            dispatch_abort_handles: dispatch_aborts,
         };
         lock.active_calls.push(active_call);
 
@@ -2479,6 +3421,8 @@ async fn initiate_call_handler(
             rtp_abort_handle: None,
             rtp_rx_abort_handle: None,
             sip_abort_handle: None,
+            bridge_abort_handle: None,
+            dispatch_abort_handles: Vec::new(),
         };
 
         let state_clone = Arc::clone(&state);
@@ -2559,6 +3503,8 @@ async fn initiate_call_handler(
                                 ch_fail.ptt_active = false;
                                 ch_fail.tx_kbps = 0;
                                 ch_fail.amp_streaming = false;
+                                ch_fail.bridge_connected = false;
+                                ch_fail.dispatch_connected = false;
                             }
                             let _ = tx_cb.send(serde_json::json!({
                                 "type": "channel_update",
@@ -2567,7 +3513,9 @@ async fn initiate_call_handler(
                                     "status": "FAILED",
                                     "pttActive": false,
                                     "txKbps": 0,
-                                    "ampStreaming": false
+                                    "ampStreaming": false,
+                                    "bridgeConnected": false,
+                                    "dispatchConnected": false
                                 }
                             }).to_string());
                             break;
@@ -2687,15 +3635,23 @@ async fn initiate_call_handler(
                                  lock_ac.active_calls.iter().find(|c| c.channel_id == id).map(|c| c.call_id.clone()).unwrap_or_else(|| format!("sip-{}", id))
                              };
                              let (amp_en, amp_ip, amp_port) = amp_settings_for(&state_audio, id).await;
-                             let rec_tap = build_recording_tap(amp_en, &amp_ip, amp_port, id).await;
+                             let rec_tap = build_recording_tap(amp_en, &amp_ip, amp_port, id, None).await;
+                             let (bridge_en, bridge_ip, bridge_port, bridge_local_port) = bridge_settings_for(&state_audio, id).await;
+                             let bridge_tap = build_recording_tap(bridge_en, &bridge_ip, bridge_port, id, Some(bridge_local_port)).await;
+                             let dispatch_outs = dispatch_outs_for(&state_audio, id).await;
+                             let has_dispatch_membership = dispatch_outs.iter().any(|d| d.is_member.load(std::sync::atomic::Ordering::Relaxed));
+                             let rtp_dest_for_bridge = rtp_dest.clone();
                              let (audio_flag, rtp_task) = start_microphone_rtp(
-                                 id, Arc::clone(&rtp_sock_task), rtp_dest, Arc::clone(&state_audio), selected_device.clone(), ptt_active_flag, call_id.clone(), rec_tap.clone()
+                                 id, Arc::clone(&rtp_sock_task), rtp_dest, Arc::clone(&state_audio), selected_device.clone(), ptt_active_flag, call_id.clone(), rec_tap.clone(), bridge_tap.clone(), dispatch_outs.clone()
                              );
 
                              let audio_flag_playback = Arc::clone(&audio_flag);
-                             let rtp_rx_task = start_audio_playback(
-                                 id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_active_flag_clone)
+                             let playback_handles = start_audio_playback(
+                                 id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_active_flag_clone), bridge_tap.clone(), rtp_dest_for_bridge, dispatch_outs
                              );
+                             let rtp_rx_task = playback_handles.rx_abort;
+                             let bridge_abort = playback_handles.bridge_abort;
+                             let dispatch_aborts = playback_handles.dispatch_aborts;
 
                             let mut lock_rtp = state_clone.lock().await;
                             if let Some(ac) = lock_rtp.active_calls.iter_mut().find(|c| c.channel_id == id) {
@@ -2703,11 +3659,35 @@ async fn initiate_call_handler(
                                 ac.ptt_active = Some(ptt_active_flag_clone);
                                 ac.rtp_abort_handle = Some(rtp_task);
                                 ac.rtp_rx_abort_handle = Some(rtp_rx_task);
+                                ac.bridge_abort_handle = bridge_abort;
+                                ac.dispatch_abort_handles = dispatch_aborts;
                             }
                             if rec_tap.is_some() {
                                 let upd = {
                                     if let Some(ch) = lock_rtp.channels.iter_mut().find(|c| c.id == id) {
                                         ch.amp_streaming = true;
+                                        Some(serde_json::json!({ "type": "channel_update", "data": ch }).to_string())
+                                    } else { None }
+                                };
+                                if let Some(upd) = upd {
+                                    let _ = lock_rtp.tx.send(upd);
+                                }
+                            }
+                            if bridge_tap.is_some() {
+                                let upd = {
+                                    if let Some(ch) = lock_rtp.channels.iter_mut().find(|c| c.id == id) {
+                                        ch.bridge_connected = true;
+                                        Some(serde_json::json!({ "type": "channel_update", "data": ch }).to_string())
+                                    } else { None }
+                                };
+                                if let Some(upd) = upd {
+                                    let _ = lock_rtp.tx.send(upd);
+                                }
+                            }
+                            if has_dispatch_membership {
+                                let upd = {
+                                    if let Some(ch) = lock_rtp.channels.iter_mut().find(|c| c.id == id) {
+                                        ch.dispatch_connected = true;
                                         Some(serde_json::json!({ "type": "channel_update", "data": ch }).to_string())
                                     } else { None }
                                 };
@@ -2737,12 +3717,23 @@ async fn initiate_call_handler(
                                 if let Some(h) = active.rtp_rx_abort_handle {
                                     h.abort();
                                 }
+                                if let Some(h) = active.bridge_abort_handle {
+                                    h.abort();
+                                }
+                                for h in active.dispatch_abort_handles {
+                                    h.abort();
+                                }
+                                for gid in 1..=DISPATCH_GROUP_COUNT {
+                                    lock_bye.dispatch_membership_flags.remove(&(id, gid));
+                                }
                             }
                             if let Some(ch_bye) = lock_bye.channels.iter_mut().find(|c| c.id == id) {
                                 ch_bye.status = "IDLE".to_string();
                                 ch_bye.ptt_active = false;
                                 ch_bye.tx_kbps = 0;
                                 ch_bye.amp_streaming = false;
+                                ch_bye.bridge_connected = false;
+                                ch_bye.dispatch_connected = false;
                             }
                             let _ = tx_cb.send(serde_json::json!({
                                 "type": "channel_update",
@@ -2751,7 +3742,9 @@ async fn initiate_call_handler(
                                     "status": "IDLE",
                                     "pttActive": false,
                                     "txKbps": 0,
-                                    "ampStreaming": false
+                                    "ampStreaming": false,
+                                    "bridgeConnected": false,
+                                    "dispatchConnected": false
                                 }
                             }).to_string());
                             break;
@@ -2802,7 +3795,16 @@ async fn hangup_handler(
         if let Some(h) = active.sip_abort_handle {
             h.abort();
         }
-        
+        if let Some(h) = active.bridge_abort_handle {
+            h.abort();
+        }
+        for h in active.dispatch_abort_handles.clone() {
+            h.abort();
+        }
+        for gid in 1..=DISPATCH_GROUP_COUNT {
+            lock.dispatch_membership_flags.remove(&(id, gid));
+        }
+
         if !is_rtp {
             let local_ip = active.local_ip.clone();
             let local_sip_port = active.local_sip_port;
@@ -2849,6 +3851,8 @@ async fn hangup_handler(
         ch.duration = 0;
         ch.ptt_active = false;
         ch.amp_streaming = false;
+        ch.bridge_connected = false;
+        ch.dispatch_connected = false;
 
         println!("[Rust Engine] [CH {}] Call/Session terminated.", id);
 
@@ -2865,7 +3869,9 @@ async fn hangup_handler(
                 "rxKbps": 0,
                 "txKbps": 0,
                 "pttActive": false,
-                "ampStreaming": false
+                "ampStreaming": false,
+                "bridgeConnected": false,
+                "dispatchConnected": false
             }
         }).to_string());
 
@@ -3086,6 +4092,12 @@ pub fn run() {
             amp_port: if ch_cfg.amp_port == 0 { 5004 + (ch_cfg.id as u16 - 1) * 2 } else { ch_cfg.amp_port },
             amp_streaming: false,
             amp_enabled: ch_cfg.amp_enabled,
+            bridge_ip: if ch_cfg.bridge_ip.is_empty() { "127.0.0.1".to_string() } else { ch_cfg.bridge_ip.clone() },
+            bridge_port: if ch_cfg.bridge_port == 0 { 6004 + (ch_cfg.id as u16 - 1) * 2 } else { ch_cfg.bridge_port },
+            bridge_enabled: ch_cfg.bridge_enabled,
+            bridge_local_port: ch_cfg.bridge_local_port,
+            bridge_connected: false,
+            dispatch_connected: false,
             secure_context: Arc::new(tokio::sync::Mutex::new(crypto::SecureChannelContext::new())),
             incoming_call: None,
         }
@@ -3098,6 +4110,12 @@ pub fn run() {
         selected_device: config.selected_device,
         sip_port: config.sip_port,
         amp_enabled: config.amp_enabled,
+        bridge_enabled: config.bridge_enabled,
+        dispatch_groups: config.dispatch_groups,
+        dispatch_buses: HashMap::new(),
+        dispatch_mirror_taps: HashMap::new(),
+        dispatch_mirror_listeners: HashMap::new(),
+        dispatch_membership_flags: HashMap::new(),
     }));
     let state_for_server = Arc::clone(&state);
 
@@ -3441,6 +4459,8 @@ pub fn run() {
                                                         matched_channel_id = Some(ch.id);
                                                         ch.status = "IDLE".to_string();
                                                         ch.amp_streaming = false;
+                                                        ch.bridge_connected = false;
+                                                        ch.dispatch_connected = false;
                                                         ch.incoming_call = None;
                                                         break;
                                                     }
@@ -3464,12 +4484,23 @@ pub fn run() {
                                                     if let Some(h) = active.sip_abort_handle {
                                                         h.abort();
                                                     }
+                                                    if let Some(h) = active.bridge_abort_handle {
+                                                        h.abort();
+                                                    }
+                                                    for h in active.dispatch_abort_handles {
+                                                        h.abort();
+                                                    }
+                                                    for gid in 1..=DISPATCH_GROUP_COUNT {
+                                                        lock.dispatch_membership_flags.remove(&(active.channel_id, gid));
+                                                    }
                                                     if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == active.channel_id) {
                                                         ch.status = "IDLE".to_string();
                                                         ch.ptt_active = false;
                                                         ch.tx_kbps = 0;
                                                         ch.audio_level = 0;
                                                         ch.amp_streaming = false;
+                                                        ch.bridge_connected = false;
+                                                        ch.dispatch_connected = false;
                                                     }
                                                 }
                                             }
@@ -3497,7 +4528,9 @@ pub fn run() {
                                                         "pttActive": false,
                                                         "txKbps": 0,
                                                         "audioLevel": 0,
-                                                        "ampStreaming": false
+                                                        "ampStreaming": false,
+                                                        "bridgeConnected": false,
+                                                        "dispatchConnected": false
                                                     }
                                                 }).to_string();
                                                 let _ = tx_chan.send(update_msg);
@@ -3619,6 +4652,8 @@ pub fn run() {
                     .route("/api/channels/:id/reject", post(reject_call_handler))
                     .route("/api/channels/:id/hangup", post(hangup_handler))
                     .route("/api/channels/:id/ptt", post(ptt_toggle_handler))
+                    .route("/api/dispatch/matrix", get(get_dispatch_matrix_handler))
+                    .route("/api/dispatch/toggle", post(dispatch_toggle_handler))
                     .route("/api/audio-devices", get(get_audio_devices_handler))
                     .route("/api/audio-devices/select", post(select_audio_device_handler))
                     .route("/api/config", get(get_config_handler))
@@ -3723,9 +4758,9 @@ async fn show_config_handler(
         channels_rows.push_str(&format!(
             r#"
             <tr>
-                <td style="font-weight: bold; text-align: center;">{:02}</td>
+                <td class="col-c"><span class="slot">{:02}</span></td>
                 <td>
-                    <select name="protocol_{}" {} style="width: 70px;">
+                    <select name="protocol_{}" {}>
                         <option value="SIP" {}>SIP</option>
                         <option value="RTP" {}>RTP</option>
                     </select>
@@ -3734,25 +4769,25 @@ async fn show_config_handler(
                     <span class="status-badge {}">{}</span>
                 </td>
                 <td>
-                    <input type="text" name="label_{}" value="{}" {} style="width: 100px;" maxlength="7" required />
+                    <input type="text" name="label_{}" value="{}" {} maxlength="7" required />
                 </td>
-                <td style="text-align: center;">
-                    <input type="checkbox" name="srtp_enabled_{}" {} {} style="width: 20px; height: 20px; cursor: pointer;" />
+                <td class="col-c">
+                    <input type="checkbox" class="chk" name="srtp_enabled_{}" {} {} />
                 </td>
-                <td style="text-align: center;">
-                    <input type="checkbox" name="sip_auth_required_{}" {} {} style="width: 20px; height: 20px; cursor: pointer;" />
-                </td>
-                <td>
-                    <input type="text" name="sip_user_{}" value="{}" {} style="width: 90px;" placeholder="receiver" />
+                <td class="col-c">
+                    <input type="checkbox" class="chk" name="sip_auth_required_{}" {} {} />
                 </td>
                 <td>
-                    <input type="text" name="target_ip_{}" value="{}" {} style="width: 125px;" placeholder="192.168.1.1" required />
+                    <input type="text" name="sip_user_{}" value="{}" {} placeholder="receiver" />
                 </td>
                 <td>
-                    <input type="number" name="target_port_{}" value="{}" {} style="width: 90px;" min="1" max="65535" required />
+                    <input type="text" name="target_ip_{}" value="{}" {} placeholder="192.168.1.1" required />
                 </td>
                 <td>
-                    <input type="number" name="local_port_{}" value="{}" {} style="width: 90px;" placeholder="Auto" min="1024" max="65535" />
+                    <input type="number" name="target_port_{}" value="{}" {} min="1" max="65535" required />
+                </td>
+                <td>
+                    <input type="number" name="local_port_{}" value="{}" {} placeholder="Auto" min="1024" max="65535" />
                 </td>
                 <td>
                     <select name="codec_{}" {}>
@@ -3761,8 +4796,15 @@ async fn show_config_handler(
                         <option value="G.711µ" {}>G.711µ</option>
                     </select>
                 </td>
-                <td style="font-size: 11px; font-family: monospace; color: #9ca3af;">
-                    Dur: {}s | Rx: {}kbps | Tx: {}kbps | PL: {:.1}% | Jit: {}ms | Lat: {}ms
+                <td>
+                    <div class="tel">
+                        <div class="m"><span class="k">DUR</span><span class="v">{}s</span></div>
+                        <div class="m"><span class="k">RX</span><span class="v">{}k</span></div>
+                        <div class="m"><span class="k">TX</span><span class="v">{}k</span></div>
+                        <div class="m"><span class="k">PL</span><span class="v">{:.1}%</span></div>
+                        <div class="m"><span class="k">JIT</span><span class="v">{}ms</span></div>
+                        <div class="m"><span class="k">LAT</span><span class="v">{}ms</span></div>
+                    </div>
                 </td>
             </tr>
             "#,
@@ -3808,7 +4850,7 @@ async fn show_config_handler(
         ));
     }
 
-    // Build A-MP (Aquilla Mirror Protocol) per-channel destination rows.
+    // Build per-channel destination rows for streaming mirror.
     let mut amp_rows = String::new();
     for ch in &lock.channels {
         let (dot_class, stream_text) = if ch.amp_streaming {
@@ -3823,19 +4865,19 @@ async fn show_config_handler(
         amp_rows.push_str(&format!(
             r#"
             <tr>
-                <td style="font-weight: bold; text-align: center;">{:02}</td>
-                <td style="color:#4b5563;">{}</td>
-                <td style="text-align: center;">
-                    <input type="checkbox" name="amp_channel_enabled_{}" {} {} style="width: 18px; height: 18px; cursor: pointer;" />
+                <td class="col-c"><span class="slot">{:02}</span></td>
+                <td style="color:var(--muted);">{}</td>
+                <td class="col-c">
+                    <input type="checkbox" class="chk" name="amp_channel_enabled_{}" {} {} />
                 </td>
                 <td>
-                    <input type="text" name="amp_ip_{}" value="{}" {} style="width: 150px;" placeholder="127.0.0.1" />
+                    <input type="text" name="amp_ip_{}" value="{}" {} placeholder="127.0.0.1" />
                 </td>
                 <td>
-                    <input type="number" name="amp_port_{}" value="{}" {} style="width: 100px;" min="0" max="65535" />
+                    <input type="number" name="amp_port_{}" value="{}" {} min="0" max="65535" />
                 </td>
-                <td style="text-align:center;">
-                    <span class="{}"></span><span style="font-size:11px; font-weight:600; color:#4b5563;">{}</span>
+                <td class="col-c">
+                    <span class="{}"></span><span class="amp-txt">{}</span>
                 </td>
             </tr>
             "#,
@@ -3856,334 +4898,532 @@ async fn show_config_handler(
     }
     let amp_enabled_checked = if lock.amp_enabled { "checked" } else { "" };
 
-    let success_banner = if saved {
-        r#"<div class="alert-success">Configuration saved successfully and synced to console panel.</div>"#
+    let mut bridge_rows = String::new();
+    for ch in &lock.channels {
+        let (dot_class, stream_text) = if ch.bridge_connected {
+            ("amp-dot amp-dot-live", "CONNECTED")
+        } else {
+            ("amp-dot", "IDLE")
+        };
+        let is_routing_or_dialing = ch.status == "CONNECTED" || ch.status == "RINGING" || ch.status == "INCOMING";
+        let disabled_attr = if is_routing_or_dialing { "disabled" } else { "" };
+        let bridge_enabled_checked = if ch.bridge_enabled { "checked" } else { "" };
+        let bridge_local_port_val = match ch.bridge_local_port {
+            Some(p) => p.to_string(),
+            None => "".to_string(),
+        };
+
+        bridge_rows.push_str(&format!(
+            r#"
+            <tr>
+                <td class="col-c"><span class="slot">{:02}</span></td>
+                <td style="color:var(--muted);">{}</td>
+                <td class="col-c">
+                    <input type="checkbox" class="chk" name="bridge_channel_enabled_{}" {} {} />
+                </td>
+                <td>
+                    <input type="text" name="bridge_ip_{}" value="{}" placeholder="127.0.0.1" />
+                </td>
+                <td>
+                    <input type="number" name="bridge_port_{}" value="{}" min="0" max="65535" />
+                </td>
+                <td>
+                    <input type="number" name="bridge_local_port_{}" value="{}" {} placeholder="Auto" min="1024" max="65535" />
+                </td>
+                <td class="col-c">
+                    <span class="{}"></span><span class="amp-txt">{}</span>
+                </td>
+            </tr>
+            "#,
+            ch.id,
+            html_escape(&ch.label),
+            ch.id,
+            bridge_enabled_checked,
+            disabled_attr,
+            ch.id,
+            html_escape(&ch.bridge_ip),
+            ch.id,
+            ch.bridge_port,
+            ch.id,
+            bridge_local_port_val,
+            disabled_attr,
+            dot_class,
+            stream_text,
+        ));
+    }
+    let bridge_enabled_checked = if lock.bridge_enabled { "checked" } else { "" };
+
+    // Build the 12-channel x 4-group patch matrix. Cells are clickable divs
+    // (NOT form inputs) that POST to /api/dispatch/toggle via fetch() and
+    // update instantly — no "Apply Configuration"/reload, by design, for
+    // quick action in an emergency. Group names are read fresh here so the
+    // column headers stay in sync with the settings table below.
+    let group_names: Vec<String> = (1..=DISPATCH_GROUP_COUNT)
+        .map(|gid| lock.dispatch_groups.iter().find(|g| g.id == gid).map(|g| g.name.clone()).unwrap_or_else(|| format!("Patch {}", gid)))
+        .collect();
+
+    let mut matrix_header_cells = String::new();
+    for (i, gid) in (1..=DISPATCH_GROUP_COUNT).enumerate() {
+        matrix_header_cells.push_str(&format!(r#"<th>{}</th>"#, html_escape(&group_names[i])));
+        let _ = gid; // header text is all we need here
+    }
+
+    let mut matrix_rows = String::new();
+    for ch in &lock.channels {
+        let mut cells = String::new();
+        for gid in 1..=DISPATCH_GROUP_COUNT {
+            let is_member = lock.dispatch_groups.iter().find(|g| g.id == gid).map(|g| g.member_ids.contains(&ch.id)).unwrap_or(false);
+            let on_class = if is_member { " matrix-on" } else { "" };
+            cells.push_str(&format!(
+                r#"<td class="matrix-cell-td"><div class="matrix-cell{}" data-channel="{}" data-group="{}" onclick="toggleDispatchCell(this)" title="CH{:02} &lt;-&gt; {}"></div></td>"#,
+                on_class, ch.id, gid, ch.id, html_escape(&group_names[(gid - 1) as usize]),
+            ));
+        }
+        matrix_rows.push_str(&format!(
+            r#"<tr><td class="matrix-label-col">{:02}</td>{}</tr>"#,
+            ch.id, cells,
+        ));
+    }
+
+    let dispatch_matrix_html = format!(
+        r#"
+        <div class="card card-flat">
+          <div class="card-head">
+            <div class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4L8.12 15.88"/><path d="M14.47 14.48L20 20"/><path d="M8.12 8.12L12 12"/></svg></div>
+            <div><div class="card-title">Patch Matrix</div><div class="card-desc">Click a cell to instantly patch/unpatch a channel into a group &mdash; takes effect immediately, even on calls already in progress. No Apply/reload needed.</div></div>
+          </div>
+          <div class="card-body">
+            <div class="table-scroll">
+              <table class="matrix-grid">
+                <thead>
+                  <tr><th class="matrix-label-col">CH</th>{}</tr>
+                </thead>
+                <tbody>
+                  {}
+                </tbody>
+              </table>
+            </div>
+            <div class="note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg><span>Only channels that are already on a live call actually hear/talk to the rest of a patch. A green cell means that channel is currently patched into that group.</span></div>
+          </div>
+        </div>
+        "#,
+        matrix_header_cells,
+        matrix_rows,
+    );
+
+    // Per-group settings (name + optional external mirror) — these are more
+    // "static config" than the matrix above, so they stay in the normal
+    // form + Apply Configuration flow.
+    let mut dispatch_settings_rows = String::new();
+    for gid in 1..=DISPATCH_GROUP_COUNT {
+        let group = lock.dispatch_groups.iter().find(|g| g.id == gid);
+        let group_name = group.map(|g| g.name.clone()).unwrap_or_else(|| format!("Patch {}", gid));
+        let mirror_enabled_checked = if group.map(|g| g.mirror_enabled).unwrap_or(false) { "checked" } else { "" };
+        let mirror_ip_val = group.map(|g| g.mirror_ip.clone()).unwrap_or_else(|| "127.0.0.1".to_string());
+        let mirror_port_val = group.map(|g| g.mirror_port).unwrap_or(0);
+        let mirror_local_port_val = match group.and_then(|g| g.mirror_local_port) {
+            Some(p) => p.to_string(),
+            None => "".to_string(),
+        };
+
+        dispatch_settings_rows.push_str(&format!(
+            r#"
+            <tr>
+                <td class="col-c"><span class="slot">P{}</span></td>
+                <td><input type="text" name="dispatch_name_{}" value="{}" maxlength="24" /></td>
+                <td class="col-c"><input type="checkbox" class="chk" name="dispatch_mirror_enabled_{}" {} /></td>
+                <td><input type="text" name="dispatch_mirror_ip_{}" value="{}" placeholder="127.0.0.1" /></td>
+                <td><input type="number" name="dispatch_mirror_port_{}" value="{}" min="0" max="65535" /></td>
+                <td><input type="number" name="dispatch_mirror_local_port_{}" value="{}" placeholder="Auto" min="1024" max="65535" /></td>
+            </tr>
+            "#,
+            gid,
+            gid, html_escape(&group_name),
+            gid, mirror_enabled_checked,
+            gid, html_escape(&mirror_ip_val),
+            gid, mirror_port_val,
+            gid, mirror_local_port_val,
+        ));
+    }
+
+    let dispatch_settings_html = format!(
+        r#"
+        <div class="card">
+          <div class="card-head">
+            <div class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></div>
+            <div><div class="card-title">Patch Group Settings</div><div class="card-desc">Rename groups and configure each group's optional external mirror (e.g. a two-way headset resource) &mdash; same idea as AMP Bridge, shared across the whole group</div></div>
+          </div>
+          <div class="card-body">
+            <div class="table-scroll">
+              <table class="grid">
+                <thead>
+                  <tr>
+                    <th class="col-c">Group</th>
+                    <th>Name</th>
+                    <th class="col-c">Mirror Enable</th>
+                    <th>Mirror Destination IP</th>
+                    <th>Mirror UDP Port</th>
+                    <th>Local Port (tell the external party to send here)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        "#,
+        dispatch_settings_rows,
+    );
+
+    // Rendered as an inert bootstrap <script> (not a visible banner) so a
+    // direct/bookmarked load of /config?saved=true or /config?error=... still
+    // surfaces the message as a toast instead of a full-width alert block.
+    // The normal Apply Configuration flow no longer navigates here at all —
+    // it saves via fetch() and calls showToast() directly.
+    let message_banner = if let Some(err) = params.get("error") {
+        format!(
+            r#"<script>window.__initialToast = {{ message: {}, type: "error" }};</script>"#,
+            serde_json::to_string(err).unwrap_or_else(|_| "\"Configuration error\"".to_string())
+        )
+    } else if saved {
+        r#"<script>window.__initialToast = { message: "Configuration saved successfully and synced to console panel.", type: "success" };</script>"#.to_string()
     } else {
-        ""
+        "".to_string()
     };
 
     let html_content = format!(
         r##"
+
         <!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>AQUILLA-12 GATEWAY CONFIGURATION</title>
+            <title>Gateway Configuration</title>
             <style>
-                body {{
-                    background-color: #f3f4f6;
-                    color: #1f2937;
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                    margin: 0;
-                    padding: 20px;
-                    font-size: 14px;
-                    line-height: 1.5;
+                :root{{
+                    --primary:#2563eb; --primary-hover:#1d4fd7; --primary-soft:#eff4ff;
+                    --page:#eef1f5; --card:#ffffff; --ink:#0f172a; --muted:#5b6472; --faint:#8a94a3;
+                    --line:#e4e8ee; --line-soft:#eef1f5; --track:#f5f7fa;
+                    --ok:#0f7a4d; --ok-bg:#e9f7ef; --ok-line:#b7e2c8;
+                    --warn:#b25e09; --warn-bg:#fdf3e6; --warn-line:#f4d9ac;
+                    --err:#c02626; --err-bg:#fdecec; --err-line:#f5c4c4;
+                    --mono:"SF Mono",ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;
                 }}
-                h1, h2 {{
-                    color: #111827;
-                    border-bottom: 1px solid #e5e7eb;
-                    padding-bottom: 8px;
-                    margin-top: 0;
-                    font-weight: 600;
-                }}
-                h1 {{
-                    font-size: 20px;
-                }}
-                h2 {{
-                    font-size: 16px;
-                }}
-                .container {{
-                    max-width: 98%;
-                    width: 98%;
-                    margin: 0 auto;
-                    border: 1px solid #e5e7eb;
-                    background: #ffffff;
-                    padding: 24px;
-                    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
-                    border-radius: 6px;
-                }}
-                .header-meta {{
-                    display: flex;
-                    justify-content: space-between;
-                    background: #f9fafb;
-                    padding: 12px 16px;
-                    border: 1px solid #e5e7eb;
-                    margin-bottom: 24px;
-                    border-radius: 4px;
-                }}
-                .meta-item {{
-                    font-size: 12px;
-                    color: #4b5563;
-                }}
-                .meta-item span {{
-                    color: #111827;
-                    font-weight: 600;
-                }}
-                .section {{
-                    background: #ffffff;
-                    border: 1px solid #e5e7eb;
-                    padding: 20px;
-                    margin-bottom: 24px;
-                    border-radius: 4px;
-                }}
-                .grid-settings {{
-                    display: grid;
-                    grid-template-columns: 1fr 1fr;
-                    gap: 20px;
-                }}
-                .form-group {{
-                    display: flex;
-                    flex-direction: column;
-                    gap: 6px;
-                }}
-                label {{
-                    color: #4b5563;
-                    font-size: 12px;
-                    font-weight: 600;
-                }}
-                input, select {{
-                    background: #ffffff;
-                    border: 1px solid #d1d5db;
-                    color: #111827;
-                    padding: 8px 12px;
-                    font-family: inherit;
-                    font-size: 14px;
-                    border-radius: 4px;
-                    box-sizing: border-box;
-                    width: 100%;
-                }}
-                input:focus, select:focus {{
-                    border-color: #3b82f6;
-                    outline: none;
-                    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
-                }}
-                .channels-table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                    margin-top: 12px;
-                }}
-                .channels-table th, .channels-table td {{
-                    border: 1px solid #e5e7eb;
-                    padding: 10px 12px;
-                    text-align: left;
-                    vertical-align: middle;
-                }}
-                .channels-table th {{
-                    background: #f9fafb;
-                    color: #4b5563;
-                    font-size: 12px;
-                    font-weight: 600;
-                }}
-                .channels-table tr:nth-child(even) {{
-                    background: #fcfdfe;
-                }}
-                .status-badge {{
-                    display: inline-block;
-                    padding: 3px 8px;
-                    font-size: 11px;
-                    font-weight: 600;
-                    text-align: center;
-                    width: 75px;
-                    border-radius: 4px;
-                    border: 1px solid #d1d5db;
-                }}
-                .status-idle {{ color: #4b5563; border-color: #d1d5db; background: #f3f4f6; }}
-                .status-ringing {{ color: #b45309; border-color: #fcd34d; background: #fef3c7; }}
-                .status-connected {{ color: #047857; border-color: #6ee7b7; background: #d1fae5; }}
-                .status-failed {{ color: #b91c1c; border-color: #fca5a5; background: #fee2e2; }}
-                
-                .btn-submit {{
-                    background: #2563eb;
-                    color: #ffffff;
-                    border: none;
-                    padding: 10px 24px;
-                    font-family: inherit;
-                    font-weight: 600;
-                    font-size: 14px;
-                    cursor: pointer;
-                    border-radius: 4px;
-                    transition: background 0.15s;
-                }}
-                .btn-submit:hover {{
-                    background: #1d4ed8;
-                }}
-                .alert-success {{
-                    border: 1px solid #6ee7b7;
-                    background: #d1fae5;
-                    color: #065f46;
-                    padding: 12px 16px;
-                    margin-bottom: 24px;
-                    font-weight: 600;
-                    border-radius: 4px;
-                }}
-                .info-note {{
-                    font-size: 12px;
-                    color: #6b7280;
-                    margin-top: 15px;
-                    line-height: 1.4;
-                }}
-                .refresh-link {{
-                    color: #2563eb;
-                    text-decoration: none;
-                }}
-                .refresh-link:hover {{
-                    text-decoration: underline;
-                }}
-                .tabs {{
-                    display: flex;
-                    gap: 4px;
-                    border-bottom: 2px solid #e5e7eb;
-                    margin-bottom: 20px;
-                }}
-                .tab-btn {{
-                    background: transparent;
-                    border: none;
-                    border-bottom: 2px solid transparent;
-                    margin-bottom: -2px;
-                    padding: 10px 18px;
-                    font-family: inherit;
-                    font-size: 13px;
-                    font-weight: 600;
-                    color: #6b7280;
-                    cursor: pointer;
-                }}
-                .tab-btn:hover {{ color: #111827; }}
-                .tab-btn.active {{
-                    color: #2563eb;
-                    border-bottom-color: #2563eb;
-                }}
-                .tab-panel {{ display: none; }}
-                .tab-panel.active {{ display: block; }}
-                .amp-toggle-row {{
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                    padding: 12px 16px;
-                    background: #f9fafb;
-                    border: 1px solid #e5e7eb;
-                    border-radius: 4px;
-                    margin-bottom: 16px;
-                }}
-                .amp-toggle-row input {{ width: 18px; height: 18px; cursor: pointer; }}
-                .amp-toggle-row label {{ font-size: 13px; color: #111827; font-weight: 600; }}
-                .amp-dot {{
-                    display: inline-block;
-                    width: 8px; height: 8px;
-                    border-radius: 50%;
-                    background: #d1d5db;
-                    margin-right: 6px;
-                    vertical-align: middle;
-                }}
-                .amp-dot-live {{
-                    background: #ef4444;
-                    box-shadow: 0 0 0 0 rgba(239,68,68,0.7);
-                    animation: amp-pulse 1.4s infinite;
-                }}
-                @keyframes amp-pulse {{
-                    0%   {{ box-shadow: 0 0 0 0 rgba(239,68,68,0.6); }}
-                    70%  {{ box-shadow: 0 0 0 6px rgba(239,68,68,0); }}
-                    100% {{ box-shadow: 0 0 0 0 rgba(239,68,68,0); }}
-                }}
+                *{{ box-sizing:border-box; }}
+                body{{ margin:0; background:var(--page); color:var(--ink);
+                    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+                    font-size:14px; line-height:1.5; -webkit-font-smoothing:antialiased; }}
+                a{{ color:inherit; }}
+                .topbar{{ position:sticky; top:0; z-index:20; background:var(--card);
+                    border-bottom:1px solid var(--line); box-shadow:0 1px 2px rgba(15,23,42,.03); }}
+                .topbar-inner{{ max-width:100%; margin:0 auto; padding:14px 28px; display:flex; align-items:center; gap:16px; }}
+                .brand{{ display:flex; align-items:center; gap:12px; }}
+                .brand-mark{{ width:38px; height:38px; border-radius:0; background:var(--ink); color:#fff;
+                    display:flex; align-items:center; justify-content:center; font-weight:700; font-size:13px; letter-spacing:.02em; }}
+                .brand-mark span{{ color:#7ab0ff; }}
+                .brand-name{{ font-size:15px; font-weight:700; letter-spacing:-.01em; line-height:1.1; }}
+                .brand-sub{{ font-size:11.5px; color:var(--faint); font-weight:500; letter-spacing:.02em; }}
+                .topbar-spacer{{ flex:1; }}
+                .pill{{ display:inline-flex; align-items:center; gap:7px; font-size:12px; font-weight:600;
+                    padding:6px 12px; border-radius:0; background:var(--ok-bg); color:var(--ok); border:1px solid var(--ok-line); }}
+                .pill .dot{{ width:7px; height:7px; border-radius:0; background:var(--ok); box-shadow:0 0 0 3px rgba(15,122,77,.15); }}
+                .btn-ghost{{ display:inline-flex; align-items:center; gap:7px; font-size:13px; font-weight:600; color:var(--muted);
+                    background:transparent; border:1px solid var(--line); border-radius:0; padding:8px 14px; cursor:pointer; text-decoration:none; transition:.15s; }}
+                .btn-ghost:hover{{ color:var(--ink); border-color:#cfd6e0; background:var(--track); }}
+                .wrap{{ max-width:100%; margin:0 auto; padding:28px 28px 100px; }}
+                .tabs{{ display:flex; gap:4px; background:var(--card); border:1px solid var(--line); border-radius:0; padding:5px; margin-bottom:24px; width:fit-content; }}
+                .tab-btn{{ background:transparent; border:none; padding:9px 20px; font-family:inherit; font-size:13.5px; font-weight:600;
+                    color:var(--muted); cursor:pointer; border-radius:0; transition:.15s; }}
+                .tab-btn:hover{{ color:var(--ink); }}
+                .tab-btn.active{{ color:var(--primary); background:var(--primary-soft); }}
+                .tab-panel{{ display:none; }}
+                .tab-panel.active{{ display:block; }}
+                .card{{ background:var(--card); border:1px solid var(--line); border-radius:0; margin-bottom:20px; overflow:hidden; }}
+                .card.card-flat{{ border-radius:0; }}
+                .card.card-flat .card-body{{ padding:14px; }}
+                .card-head{{ display:flex; align-items:center; gap:12px; padding:18px 22px; border-bottom:1px solid var(--line-soft); }}
+                .card-ico{{ width:34px; height:34px; border-radius:0; background:var(--primary-soft); color:var(--primary);
+                    display:flex; align-items:center; justify-content:center; flex:0 0 auto; }}
+                .card-ico svg{{ width:18px; height:18px; }}
+                .card-title{{ font-size:14.5px; font-weight:700; letter-spacing:-.01em; }}
+                .card-desc{{ font-size:12px; color:var(--faint); font-weight:500; margin-top:1px; }}
+                .card-body{{ padding:22px; }}
+                .grid2{{ display:grid; grid-template-columns:1fr 1fr; gap:22px; }}
+                .grid3{{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:22px; }}
+                .field{{ display:flex; flex-direction:column; gap:7px; }}
+                .field label{{ font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }}
+                input,select{{ width:100%; height:38px; background:#fff; border:1px solid var(--line); color:var(--ink);
+                    padding:0 12px; font-family:inherit; font-size:13.5px; border-radius:0; transition:.15s; }}
+                input::placeholder{{ color:var(--faint); }}
+                input:focus,select:focus{{ outline:none; border-color:var(--primary); box-shadow:0 0 0 3px rgba(37,99,235,.14); }}
+                input:disabled,select:disabled{{ background:var(--track); color:var(--faint); cursor:not-allowed; }}
+                .table-scroll{{ width:100%; overflow-x:auto; }}
+                table.grid{{ width:100%; border-collapse:separate; border-spacing:0; min-width:1060px; }}
+                table.grid th{{ background:var(--track); color:var(--muted); font-size:10.5px; font-weight:700;
+                    text-transform:uppercase; letter-spacing:.05em; text-align:left; padding:11px 14px; border-bottom:1px solid var(--line); white-space:nowrap; }}
+                table.grid td{{ padding:9px 14px; border-bottom:1px solid var(--line-soft); vertical-align:middle; }}
+                table.grid tr:last-child td{{ border-bottom:none; }}
+                table.grid tbody tr:hover td{{ background:#fafbfd; }}
+                table.grid input,table.grid select{{ height:34px; font-size:13px; }}
+                .col-c{{ text-align:center; }}
+                .slot{{ font-family:var(--mono); font-weight:700; font-size:12.5px; color:var(--ink);
+                    background:var(--track); border:1px solid var(--line); border-radius:0; padding:3px 8px; display:inline-block; }}
+                .status-badge{{ display:inline-block; min-width:76px; text-align:center; font-size:10.5px; font-weight:700; letter-spacing:.04em;
+                    padding:5px 8px; border-radius:0; border:1px solid var(--line); }}
+                .status-idle{{ color:var(--muted); background:var(--track); border-color:var(--line); }}
+                .status-connected{{ color:var(--ok); background:var(--ok-bg); border-color:var(--ok-line); }}
+                .status-ringing{{ color:var(--warn); background:var(--warn-bg); border-color:var(--warn-line); }}
+                .status-failed{{ color:var(--err); background:var(--err-bg); border-color:var(--err-line); }}
+                .chk{{ width:18px; height:18px; accent-color:var(--primary); cursor:pointer; }}
+                .tel{{ display:grid; grid-template-columns:repeat(3,minmax(44px,1fr)); gap:3px 10px; min-width:150px; }}
+                .tel .m{{ display:flex; align-items:baseline; gap:5px; white-space:nowrap; }}
+                .tel .k{{ font-size:9.5px; font-weight:700; color:var(--faint); letter-spacing:.04em; width:22px; }}
+                .tel .v{{ font-family:var(--mono); font-size:11.5px; font-weight:600; color:var(--muted); }}
+                .switch-row{{ display:flex; align-items:center; gap:14px; padding:16px 18px; background:var(--primary-soft);
+                    border:1px solid #d3e0fb; border-radius:0; margin-bottom:16px; }}
+                .switch{{ position:relative; display:inline-block; width:44px; height:24px; flex:0 0 auto; }}
+                .switch input{{ opacity:0; width:0; height:0; }}
+                .slider{{ position:absolute; inset:0; background:#c3cbd8; border-radius:0; transition:.18s; cursor:pointer; }}
+                .slider:before{{ content:""; position:absolute; height:18px; width:18px; left:3px; top:3px; background:#fff; border-radius:0; transition:.18s; box-shadow:0 1px 2px rgba(0,0,0,.2); }}
+                .switch input:checked + .slider{{ background:var(--primary); }}
+                .switch input:checked + .slider:before{{ transform:translateX(20px); }}
+                .switch-row .txt b{{ font-size:13.5px; font-weight:700; }}
+                .switch-row .txt p{{ margin:2px 0 0; font-size:12px; color:var(--muted); }}
+                .amp-dot{{ display:inline-block; width:8px; height:8px; border-radius:0; background:#cbd3de; margin-right:7px; vertical-align:middle; }}
+                .amp-dot-live{{ background:var(--err); box-shadow:0 0 0 0 rgba(192,38,38,.4); animation:amp-pulse 1.4s infinite; }}
+                .amp-txt{{ font-size:11px; font-weight:700; color:var(--muted); letter-spacing:.03em; }}
+                @keyframes amp-pulse{{ 0%{{ box-shadow:0 0 0 0 rgba(192,38,38,.4);}} 70%{{ box-shadow:0 0 0 6px rgba(192,38,38,0);}} 100%{{ box-shadow:0 0 0 0 rgba(192,38,38,0);}} }}
+                .note{{ display:flex; align-items:flex-start; gap:7px; font-size:12px; color:var(--faint); line-height:1.5; padding:14px 22px 18px; }}
+                .note svg{{ width:15px; height:15px; flex:0 0 auto; margin-top:1px; color:var(--faint); }}
+                .matrix-grid{{ width:auto; border-collapse:collapse; border-spacing:0; min-width:0; }}
+                .matrix-grid th{{ background:var(--track); color:var(--muted); font-size:10px; font-weight:700;
+                    text-transform:uppercase; letter-spacing:.04em; text-align:center; padding:5px 8px; border:1px solid var(--line); white-space:nowrap; }}
+                .matrix-label-col{{ text-align:center !important; white-space:nowrap; font-size:11.5px; font-weight:700; color:var(--ink);
+                    padding:0 !important; width:30px; background:var(--track); border:1px solid var(--line); }}
+                .matrix-cell-td{{ text-align:center; padding:0 !important; border:1px solid var(--line); }}
+                .matrix-cell{{ width:28px; height:28px; display:block; margin:0; border-radius:0; background:var(--track); border:none; cursor:pointer; transition:.1s; }}
+                .matrix-cell:hover{{ box-shadow:inset 0 0 0 2px var(--primary); }}
+                .matrix-cell.matrix-on{{ background:var(--ok); }}
+                .matrix-cell.matrix-on:hover{{ background:var(--ok); }}
+                .matrix-cell.matrix-pending{{ opacity:.5; cursor:wait; }}
+                .actionbar{{ position:fixed; left:50%; bottom:22px; z-index:30;
+                    transform:translate(-50%, 140%); opacity:0; pointer-events:none;
+                    background:var(--card); border:1px solid var(--line); box-shadow:0 8px 24px rgba(15,23,42,.16);
+                    transition:transform .2s ease, opacity .2s ease; }}
+                .actionbar.visible{{ transform:translate(-50%, 0); opacity:1; pointer-events:auto; }}
+                .actionbar-inner{{ padding:12px 16px 12px 20px; display:flex; align-items:center; gap:16px; }}
+                .action-hint{{ font-size:12px; color:var(--faint); white-space:nowrap; }}
+                .btn-primary{{ background:var(--primary); color:#fff; border:none; padding:11px 26px; font-family:inherit; font-weight:700;
+                    font-size:14px; border-radius:0; cursor:pointer; transition:.15s; box-shadow:0 1px 2px rgba(37,99,235,.25); white-space:nowrap; }}
+                .btn-primary:hover{{ background:var(--primary-hover); }}
+                .btn-primary:active{{ transform:scale(.98); }}
+                .toast-container{{ position:fixed; top:20px; right:20px; z-index:50; display:flex; flex-direction:column; gap:10px; max-width:380px; }}
+                .toast{{ padding:14px 18px; font-weight:600; font-size:13.5px; border-radius:0; box-shadow:0 6px 20px rgba(15,23,42,.14);
+                    opacity:0; transform:translateY(-10px); transition:opacity .2s ease, transform .2s ease; }}
+                .toast.show{{ opacity:1; transform:translateY(0); }}
+                .toast-ok{{ color:var(--ok); background:var(--ok-bg); border:1px solid var(--ok-line); }}
+                .toast-err{{ color:var(--err); background:var(--err-bg); border:1px solid var(--err-line); }}
             </style>
         </head>
         <body>
-            <div class="container">
-                <h1>AQUILLA-12 :: Web Config Gateway</h1>
-                
-                <div class="header-meta">
-                    <div class="meta-item">STATE: <span>ACTIVE</span></div>
-                    <div class="meta-item"><a href="/config" class="refresh-link">Refresh Diagnostics</a></div>
+            <div id="toast-container" class="toast-container"></div>
+            <div class="topbar">
+                <div class="topbar-inner">
+                    <div class="brand">
+                        <div class="brand-mark">A<span>12</span></div>
+                        <div>
+                            <div class="brand-name">Aquilla 12 Gateway</div>
+                            <div class="brand-sub">Secure Voice Configuration Console</div>
+                        </div>
+                    </div>
+                    <div class="topbar-spacer"></div>
+                    <div class="pill"><span class="dot"></span> System Active</div>
+                    <a href="/config" class="btn-ghost"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10M1 14l4.6 4.4A9 9 0 0 0 20.5 15"/></svg> Refresh</a>
                 </div>
+            </div>
 
+            <div class="wrap">
                 {}
 
                 <div class="tabs">
-                    <button type="button" class="tab-btn active" data-tab="tab-channels" onclick="switchTab('tab-channels', this)">Channel Mapping</button>
-                    <button type="button" class="tab-btn" data-tab="tab-amp" onclick="switchTab('tab-amp', this)">A-MP Stream Mapping</button>
+                    <button type="button" class="tab-btn active" data-tab="tab-channels" onclick="switchTab('tab-channels', this)">Channels</button>
+                    <button type="button" class="tab-btn" data-tab="tab-amp" onclick="switchTab('tab-amp', this)">A-MP</button>
+                    <button type="button" class="tab-btn" data-tab="tab-bridge" onclick="switchTab('tab-bridge', this)">AMP Bridge</button>
+                    <button type="button" class="tab-btn" data-tab="tab-dispatch" onclick="switchTab('tab-dispatch', this)">Dispatcher</button>
                 </div>
 
-                <form method="POST" action="/config/save">
+                <form id="config-form" method="POST" action="/config/save" onsubmit="handleSubmit(event)">
                   <div id="tab-channels" class="tab-panel active">
-                    <div class="section">
-                        <h2>General Interface Configuration</h2>
-                        <div class="grid-settings">
-                            <div class="form-group">
-                                <label for="sip_port">Local SIP Listening Port</label>
-                                <input type="number" id="sip_port" name="sip_port" value="{}" min="1" max="65535" required />
-                            </div>
-                            <div class="form-group">
-                                <label for="selected_device">Active Audio Input Interface</label>
-                                <select id="selected_device" name="selected_device">
-                                    {}
-                                </select>
-                            </div>
+                    <div class="card">
+                      <div class="card-head">
+                        <div class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
+                        <div><div class="card-title">System Interface</div><div class="card-desc">Primary signalling port and audio capture device</div></div>
+                      </div>
+                      <div class="card-body">
+                        <div class="grid2">
+                          <div class="field">
+                            <label for="sip_port">Listening Port</label>
+                            <input type="number" id="sip_port" name="sip_port" value="{}" min="1024" max="65535" required />
+                          </div>
+                          <div class="field">
+                            <label for="selected_device">Active Audio Input Interface</label>
+                            <select id="selected_device" name="selected_device">{}</select>
+                          </div>
                         </div>
+                      </div>
                     </div>
 
-                    <div class="section">
-                        <h2>Hardware Audio Channel Mapping</h2>
-                        <table class="channels-table">
-                            <thead>
-                                <tr>
-                                    <th style="width: 4%; text-align: center;">Slot</th>
-                                    <th style="width: 8%;">Protocol</th>
-                                    <th style="width: 8%;">Status</th>
-                                    <th style="width: 12%;">Channel Alias</th>
-                                    <th style="width: 6%; text-align: center;">SRTP</th>
-                                    <th style="width: 6%; text-align: center;">SIP Auth</th>
-                                    <th style="width: 10%;">SIP User</th>
-                                    <th style="width: 14%;">Destination IP</th>
-                                    <th style="width: 8%;">Dest Port</th>
-                                    <th style="width: 8%;">Local Port</th>
-                                    <th style="width: 8%;">Codec</th>
-                                    <th style="width: 14%;">Live Telemetry Stream</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {}
-                            </tbody>
+                    <div class="card">
+                      <div class="card-head">
+                        <div class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 3v4M8 3v4M2 11h20"/></svg></div>
+                        <div><div class="card-title">Port Mapping</div><div class="card-desc">Per-channel protocol, destination and live telemetry</div></div>
+                      </div>
+                      <div class="table-scroll">
+                        <table class="grid">
+                          <thead>
+                            <tr>
+                              <th class="col-c">Slot</th>
+                              <th>Protocol</th>
+                              <th>Status</th>
+                              <th>Channel Alias</th>
+                              <th class="col-c">SRTP</th>
+                              <th class="col-c">SIP Auth</th>
+                              <th>Receiver / User</th>
+                              <th>Destination IP</th>
+                              <th>Dest Port</th>
+                              <th>Local Port</th>
+                              <th>Codec</th>
+                              <th>Stream Quality</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {}
+                          </tbody>
                         </table>
-                        <div class="info-note">
-                            * Note: Channel parameters (Alias, Destination, Codec) cannot be modified while the respective channel is active (Routing or Dialing).
-                        </div>
+                      </div>
+                      <div class="note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg><span>Channel parameters (alias, destination, codec) cannot be modified while a channel is active (routing or dialing).</span></div>
                     </div>
                   </div>
 
                   <div id="tab-amp" class="tab-panel">
-                    <div class="section">
-                        <h2>A-MP Stream Mapping (NP-C4I Recorder)</h2>
-                        <div class="amp-toggle-row">
-                            <input type="checkbox" id="amp_enabled" name="amp_enabled" {} />
-                            <label for="amp_enabled">Enable A-MP call mirroring to the NP-C4I Recorder (global master switch)</label>
+                    <div class="card">
+                      <div class="card-head">
+                        <div class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="9"/></svg></div>
+                        <div><div class="card-title">A-MP (Aquilla Multiduplex Protocol)</div><div class="card-desc">Duplicate active calls to a recording destination</div></div>
+                      </div>
+                      <div class="card-body">
+                        <div class="switch-row">
+                          <label class="switch"><input type="checkbox" id="amp_enabled" name="amp_enabled" {} /><span class="slider"></span></label>
+                          <div class="txt"><b>Enable audio stream mirroring</b><p>Global master switch. Set a channel port to 0 to disable mirroring for that channel.</p></div>
                         </div>
-                        <div class="info-note" style="margin-top:0; margin-bottom:8px;">
-                            Each active call is mirrored to the recorder as clean RTP/PCMU. Set the destination IP and UDP port per channel to match the recorder's listening ports (defaults: CH01&rarr;5004, CH02&rarr;5006, CH03&rarr;5008, CH04&rarr;5010). Set port to 0 to disable a channel.
-                        </div>
-                        <table class="channels-table">
+                        <div class="table-scroll">
+                          <table class="grid">
                             <thead>
-                                <tr>
-                                    <th style="width: 6%; text-align: center;">Slot</th>
-                                    <th style="width: 22%;">Channel Alias</th>
-                                    <th style="width: 10%; text-align: center;">Enable</th>
-                                    <th style="width: 26%;">Recorder Destination IP</th>
-                                    <th style="width: 20%;">Recorder UDP Port</th>
-                                    <th style="width: 16%; text-align:center;">Mirror State</th>
-                                </tr>
+                              <tr>
+                                <th class="col-c">Slot</th>
+                                <th>Channel Alias</th>
+                                <th class="col-c">Enable</th>
+                                <th>Recorder Destination IP</th>
+                                <th>Recorder UDP Port</th>
+                                <th class="col-c">Mirror State</th>
+                              </tr>
                             </thead>
                             <tbody>
-                                {}
+                              {}
                             </tbody>
-                        </table>
+                          </table>
+                        </div>
+                      </div>
                     </div>
                   </div>
 
-                    <div style="text-align: right;">
-                        <button type="submit" class="btn-submit">Apply Configuration</button>
+                  <div id="tab-bridge" class="tab-panel">
+                    <div class="card">
+                      <div class="card-head">
+                        <div class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></div>
+                        <div><div class="card-title">AMP Bridge</div><div class="card-desc">Two-way interop leg mixed live into the call &mdash; not just a recording tap</div></div>
+                      </div>
+                      <div class="card-body">
+                        <div class="switch-row">
+                          <label class="switch"><input type="checkbox" id="bridge_enabled" name="bridge_enabled" {} /><span class="slider"></span></label>
+                          <div class="txt"><b>Enable AMP Bridge</b><p>Global master switch. The bridge leg is started/stopped with the call and is heard on, and can talk into, both ends of the primary channel.</p></div>
+                        </div>
+                        <div class="table-scroll">
+                          <table class="grid">
+                            <thead>
+                              <tr>
+                                <th class="col-c">Slot</th>
+                                <th>Channel Alias</th>
+                                <th class="col-c">Enable</th>
+                                <th>AMP Bridge Destination IP</th>
+                                <th>AMP Bridge UDP Port</th>
+                                <th>Local Port (tell the AMP Bridge peer to send here)</th>
+                                <th class="col-c">Bridge State</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {}
+                            </tbody>
+                          </table>
+                        </div>
+                        <div class="note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg><span>Unlike A-MP, this is a live two-way leg: the AMP Bridge party is mixed into the local speaker output and forwarded to the primary destination as its own RTP stream.</span></div>
+                      </div>
                     </div>
+                  </div>
+
+                  <div id="tab-dispatch" class="tab-panel">
+                    {}
+                    {}
+                  </div>
+
+                  <div id="actionbar" class="actionbar">
+                    <div class="actionbar-inner">
+                      <span class="action-hint">Unsaved changes &mdash; new calls only</span>
+                      <button type="submit" class="btn-primary">Apply Configuration</button>
+                    </div>
+                  </div>
                 </form>
             </div>
             <script>
+            // Toast notifications — replaces the old full-width alert banner
+            // that required a page reload (?saved=true / ?error=...) to show.
+            function showToast(message, type) {{
+                const container = document.getElementById("toast-container");
+                if (!container) return;
+                const toast = document.createElement("div");
+                toast.className = "toast " + (type === "error" ? "toast-err" : "toast-ok");
+                toast.textContent = message;
+                container.appendChild(toast);
+                requestAnimationFrame(() => toast.classList.add("show"));
+                setTimeout(() => {{
+                    toast.classList.remove("show");
+                    setTimeout(() => toast.remove(), 250);
+                }}, 5000);
+            }}
+
+            // Floating "Apply Configuration" button — only shown once the form
+            // has unsaved changes, hidden again right after a successful save.
+            const configForm = document.getElementById("config-form");
+            const actionbar = document.getElementById("actionbar");
+            let formIsDirty = false;
+            function markFormDirty() {{
+                if (!formIsDirty) {{
+                    formIsDirty = true;
+                    if (actionbar) actionbar.classList.add("visible");
+                }}
+            }}
+            function clearFormDirty() {{
+                formIsDirty = false;
+                if (actionbar) actionbar.classList.remove("visible");
+            }}
+            if (configForm) {{
+                configForm.addEventListener("input", markFormDirty);
+                configForm.addEventListener("change", markFormDirty);
+            }}
+
             function switchTab(tabId, btn) {{
                 document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
                 document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
@@ -4191,6 +5431,55 @@ async fn show_config_handler(
                 if (panel) panel.classList.add("active");
                 if (btn) btn.classList.add("active");
             }}
+
+            // Dispatcher patch matrix — instant toggle, no Apply/reload.
+            function toggleDispatchCell(el) {{
+                if (el.classList.contains("matrix-pending")) return;
+                const channelId = parseInt(el.dataset.channel, 10);
+                const groupId = parseInt(el.dataset.group, 10);
+                el.classList.add("matrix-pending");
+                fetch("/api/dispatch/toggle", {{
+                    method: "POST",
+                    headers: {{ "Content-Type": "application/json" }},
+                    body: JSON.stringify({{ groupId: groupId, channelId: channelId }})
+                }}).then((r) => r.json()).then((data) => {{
+                    el.classList.remove("matrix-pending");
+                    if (data && data.success) {{
+                        el.classList.toggle("matrix-on", !!data.isMember);
+                    }}
+                }}).catch(() => {{
+                    el.classList.remove("matrix-pending");
+                }});
+            }}
+
+            // Keep the matrix in sync with changes made from elsewhere (the
+            // console app's own quick-access matrix, or another admin tab).
+            (function connectDispatchMatrixSync() {{
+                function connect() {{
+                    try {{
+                        const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+                        const ws = new WebSocket(proto + "//" + window.location.host + "/events");
+                        ws.onmessage = function (evt) {{
+                            try {{
+                                const payload = JSON.parse(evt.data);
+                                if (payload.type === "dispatch_matrix_update") {{
+                                    const groups = payload.data.groups || [];
+                                    groups.forEach(function (g) {{
+                                        document.querySelectorAll('.matrix-cell[data-group="' + g.id + '"]').forEach(function (cell) {{
+                                            const chId = parseInt(cell.dataset.channel, 10);
+                                            const isMember = (g.memberIds || []).indexOf(chId) !== -1;
+                                            cell.classList.toggle("matrix-on", isMember);
+                                        }});
+                                    }});
+                                }}
+                            }} catch (e) {{ /* ignore malformed message */ }}
+                        }};
+                        ws.onclose = function () {{ setTimeout(connect, 3000); }};
+                        ws.onerror = function () {{ ws.close(); }};
+                    }} catch (e) {{ /* WebSocket unavailable, matrix still works via direct clicks */ }}
+                }}
+                connect();
+            }})();
             function updateSipUserState(id) {{
                 const protoSelect = document.getElementsByName("protocol_" + id)[0];
                 const sipUserInput = document.getElementsByName("sip_user_" + id)[0];
@@ -4198,7 +5487,7 @@ async fn show_config_handler(
                 if (protoSelect && sipUserInput) {{
                     if (protoSelect.value === "RTP") {{
                         sipUserInput.disabled = true;
-                        sipUserInput.style.backgroundColor = "#f3f4f6";
+                        sipUserInput.style.backgroundColor = "var(--track)";
                         sipUserInput.style.cursor = "not-allowed";
                         sipUserInput.value = "";
                         if (targetPortInput && (targetPortInput.value === "5060" || targetPortInput.value === "")) {{
@@ -4222,17 +5511,197 @@ async fn show_config_handler(
                         updateSipUserState(id);
                     }}
                 }}
+                if (window.__initialToast) {{
+                    showToast(window.__initialToast.message, window.__initialToast.type);
+                }}
             }});
+            function handleSubmit(event) {{
+                event.preventDefault();
+                document.querySelectorAll("input").forEach(i => i.style.borderColor = "");
+                const errors = [];
+                const sipPort = parseInt(document.getElementById("sip_port").value, 10);
+                if (isNaN(sipPort) || sipPort < 1024 || sipPort > 65535) {{
+                    errors.push("Listening Port must be between 1024 and 65535.");
+                    document.getElementById("sip_port").style.borderColor = "var(--err)";
+                }}
+                const localPorts = {{}};
+                const mirrorPorts = {{}};
+                const bridgePorts = {{}};
+                const ampEnabled = document.getElementById("amp_enabled").checked;
+                const bridgeEnabled = document.getElementById("bridge_enabled").checked;
+                for (let id = 1; id <= 12; id++) {{
+                    const labelInput = document.getElementsByName("label_" + id)[0];
+                    const localPortInput = document.getElementsByName("local_port_" + id)[0];
+                    const targetIpInput = document.getElementsByName("target_ip_" + id)[0];
+                    const targetPortInput = document.getElementsByName("target_port_" + id)[0];
+                    if (labelInput && !labelInput.disabled) {{
+                        const labelVal = labelInput.value.trim();
+                        if (labelVal.length === 0) {{
+                            errors.push("Channel " + id + " Alias cannot be empty.");
+                            labelInput.style.borderColor = "var(--err)";
+                        }}
+                        const targetIpVal = targetIpInput.value.trim();
+                        if (targetIpVal.length === 0) {{
+                            errors.push("Channel " + id + " Destination IP cannot be empty.");
+                            targetIpInput.style.borderColor = "var(--err)";
+                        }}
+                        const targetPortVal = parseInt(targetPortInput.value, 10);
+                        if (isNaN(targetPortVal) || targetPortVal < 1 || targetPortVal > 65535) {{
+                            errors.push("Channel " + id + " Destination Port must be between 1 and 65535.");
+                            targetPortInput.style.borderColor = "var(--err)";
+                        }}
+                        if (localPortInput && localPortInput.value.trim() !== "") {{
+                            const localPortVal = parseInt(localPortInput.value, 10);
+                            if (isNaN(localPortVal) || localPortVal < 1024 || localPortVal > 65535) {{
+                                errors.push("Channel " + id + " Local Port must be between 1024 and 65535.");
+                                localPortInput.style.borderColor = "var(--err)";
+                            }} else if (localPortVal === sipPort) {{
+                                errors.push("Channel " + id + " Local Port (" + localPortVal + ") conflicts with primary Listening Port.");
+                                localPortInput.style.borderColor = "var(--err)";
+                            }} else if (localPorts[localPortVal]) {{
+                                errors.push("Channel " + id + " Local Port (" + localPortVal + ") is duplicated with Channel " + localPorts[localPortVal] + ".");
+                                localPortInput.style.borderColor = "var(--err)";
+                                document.getElementsByName("local_port_" + localPorts[localPortVal])[0].style.borderColor = "var(--err)";
+                            }} else {{
+                                localPorts[localPortVal] = id;
+                            }}
+                        }}
+                    }}
+                    const ampChanEnabledInput = document.getElementsByName("amp_channel_enabled_" + id)[0];
+                    const ampPortInput = document.getElementsByName("amp_port_" + id)[0];
+                    if (ampEnabled && ampChanEnabledInput && ampChanEnabledInput.checked) {{
+                        if (ampPortInput) {{
+                            const ampPortVal = parseInt(ampPortInput.value, 10);
+                            if (isNaN(ampPortVal) || ampPortVal < 1 || ampPortVal > 65535) {{
+                                errors.push("Channel " + id + " Mirror Port must be between 1 and 65535 when mirroring is enabled.");
+                                ampPortInput.style.borderColor = "var(--err)";
+                            }} else if (mirrorPorts[ampPortVal]) {{
+                                errors.push("Channel " + id + " Mirror Port (" + ampPortVal + ") is duplicated with Channel " + mirrorPorts[ampPortVal] + ".");
+                                ampPortInput.style.borderColor = "var(--err)";
+                                document.getElementsByName("amp_port_" + mirrorPorts[ampPortVal])[0].style.borderColor = "var(--err)";
+                            }} else {{
+                                mirrorPorts[ampPortVal] = id;
+                            }}
+                        }}
+                    }}
+
+                    const bridgeChanEnabledInput = document.getElementsByName("bridge_channel_enabled_" + id)[0];
+                    const bridgePortInput = document.getElementsByName("bridge_port_" + id)[0];
+                    if (bridgeEnabled && bridgeChanEnabledInput && bridgeChanEnabledInput.checked) {{
+                        if (bridgePortInput) {{
+                            const bridgePortVal = parseInt(bridgePortInput.value, 10);
+                            if (isNaN(bridgePortVal) || bridgePortVal < 1 || bridgePortVal > 65535) {{
+                                errors.push("Channel " + id + " Bridge Port must be between 1 and 65535 when AMP Bridge is enabled.");
+                                bridgePortInput.style.borderColor = "var(--err)";
+                            }} else if (bridgePorts[bridgePortVal]) {{
+                                errors.push("Channel " + id + " Bridge Port (" + bridgePortVal + ") is duplicated with Channel " + bridgePorts[bridgePortVal] + ".");
+                                bridgePortInput.style.borderColor = "var(--err)";
+                                document.getElementsByName("bridge_port_" + bridgePorts[bridgePortVal])[0].style.borderColor = "var(--err)";
+                            }} else {{
+                                bridgePorts[bridgePortVal] = id;
+                            }}
+                        }}
+                    }}
+
+                    const bridgeLocalPortInput = document.getElementsByName("bridge_local_port_" + id)[0];
+                    if (bridgeLocalPortInput && bridgeLocalPortInput.value.trim() !== "") {{
+                        const bridgeLocalPortVal = parseInt(bridgeLocalPortInput.value, 10);
+                        if (isNaN(bridgeLocalPortVal) || bridgeLocalPortVal < 1024 || bridgeLocalPortVal > 65535) {{
+                            errors.push("Channel " + id + " Bridge Local Port must be between 1024 and 65535.");
+                            bridgeLocalPortInput.style.borderColor = "var(--err)";
+                        }} else if (bridgeLocalPortVal === sipPort) {{
+                            errors.push("Channel " + id + " Bridge Local Port (" + bridgeLocalPortVal + ") conflicts with primary Listening Port.");
+                            bridgeLocalPortInput.style.borderColor = "var(--err)";
+                        }} else if (localPorts[bridgeLocalPortVal]) {{
+                            errors.push("Channel " + id + " Bridge Local Port (" + bridgeLocalPortVal + ") is duplicated with another Local Port on Channel " + localPorts[bridgeLocalPortVal] + ".");
+                            bridgeLocalPortInput.style.borderColor = "var(--err)";
+                        }} else {{
+                            localPorts[bridgeLocalPortVal] = id;
+                        }}
+                    }}
+                }}
+                const dispatchMirrorPorts = {{}};
+                for (let gid = 1; gid <= 4; gid++) {{
+                    const mirrorEnabledInput = document.getElementsByName("dispatch_mirror_enabled_" + gid)[0];
+                    const mirrorPortInput = document.getElementsByName("dispatch_mirror_port_" + gid)[0];
+                    if (mirrorEnabledInput && mirrorEnabledInput.checked && mirrorPortInput) {{
+                        const mirrorPortVal = parseInt(mirrorPortInput.value, 10);
+                        if (isNaN(mirrorPortVal) || mirrorPortVal < 1 || mirrorPortVal > 65535) {{
+                            errors.push("Dispatcher Group " + gid + " Mirror Port must be between 1 and 65535 when the mirror is enabled.");
+                            mirrorPortInput.style.borderColor = "var(--err)";
+                        }} else if (dispatchMirrorPorts[mirrorPortVal]) {{
+                            errors.push("Dispatcher Group " + gid + " Mirror Port (" + mirrorPortVal + ") is duplicated with Group " + dispatchMirrorPorts[mirrorPortVal] + ".");
+                            mirrorPortInput.style.borderColor = "var(--err)";
+                            document.getElementsByName("dispatch_mirror_port_" + dispatchMirrorPorts[mirrorPortVal])[0].style.borderColor = "var(--err)";
+                        }} else {{
+                            dispatchMirrorPorts[mirrorPortVal] = gid;
+                        }}
+                    }}
+                    const mirrorLocalPortInput = document.getElementsByName("dispatch_mirror_local_port_" + gid)[0];
+                    if (mirrorLocalPortInput && mirrorLocalPortInput.value.trim() !== "") {{
+                        const mirrorLocalPortVal = parseInt(mirrorLocalPortInput.value, 10);
+                        if (isNaN(mirrorLocalPortVal) || mirrorLocalPortVal < 1024 || mirrorLocalPortVal > 65535) {{
+                            errors.push("Dispatcher Group " + gid + " Local Port must be between 1024 and 65535.");
+                            mirrorLocalPortInput.style.borderColor = "var(--err)";
+                        }} else if (mirrorLocalPortVal === sipPort) {{
+                            errors.push("Dispatcher Group " + gid + " Local Port (" + mirrorLocalPortVal + ") conflicts with primary Listening Port.");
+                            mirrorLocalPortInput.style.borderColor = "var(--err)";
+                        }} else if (localPorts[mirrorLocalPortVal]) {{
+                            errors.push("Dispatcher Group " + gid + " Local Port (" + mirrorLocalPortVal + ") is duplicated with another Local Port on Channel " + localPorts[mirrorLocalPortVal] + ".");
+                            mirrorLocalPortInput.style.borderColor = "var(--err)";
+                        }} else {{
+                            localPorts[mirrorLocalPortVal] = "Dispatcher Group " + gid;
+                        }}
+                    }}
+                }}
+                if (errors.length > 0) {{
+                    const summary = errors.length === 1
+                        ? errors[0]
+                        : errors.length + " issues found: " + errors[0] + (errors.length > 1 ? " (+" + (errors.length - 1) + " more)" : "");
+                    showToast(summary, "error");
+                    const firstBad = document.querySelector('input[style*="border-color"]');
+                    if (firstBad) firstBad.scrollIntoView({{ behavior: "smooth", block: "center" }});
+                    return;
+                }}
+
+                // Client-side validation passed — submit via fetch so the page
+                // never reloads. Disabled fields and unchecked checkboxes are
+                // automatically left out of FormData, same as a normal submit.
+                const submitBtn = configForm.querySelector('button[type="submit"]');
+                if (submitBtn) submitBtn.disabled = true;
+                fetch(configForm.action || "/config/save", {{
+                    method: "POST",
+                    headers: {{ "Accept": "application/json" }},
+                    body: new URLSearchParams(new FormData(configForm))
+                }}).then((r) => r.json().catch(() => ({{}})).then((data) => ({{ ok: r.ok, data: data }})))
+                  .then(({{ ok, data }}) => {{
+                    if (ok && data && data.success) {{
+                        showToast(data.message || "Configuration saved successfully and synced to console panel.", "success");
+                        clearFormDirty();
+                    }} else {{
+                        showToast((data && data.error) || "Failed to save configuration.", "error");
+                    }}
+                }}).catch(() => {{
+                    showToast("Failed to save configuration. Check the connection and try again.", "error");
+                }}).finally(() => {{
+                    if (submitBtn) submitBtn.disabled = false;
+                }});
+            }}
             </script>
         </body>
         </html>
+        
         "##,
-        success_banner,
+        message_banner,
         lock.sip_port,
         devices_options,
         channels_rows,
         amp_enabled_checked,
-        amp_rows
+        amp_rows,
+        bridge_enabled_checked,
+        bridge_rows,
+        dispatch_matrix_html,
+        dispatch_settings_html
     );
 
     Html(html_content)
@@ -4245,12 +5714,259 @@ async fn save_config_handler(
 ) -> impl IntoResponse {
     let mut lock = state.lock().await;
     
-    // Parse general settings
+    // Let's first validate the incoming Form data!
+    let mut sip_port = lock.sip_port;
     if let Some(port_str) = form_data.get("sip_port") {
         if let Ok(port) = port_str.parse::<u16>() {
-            lock.sip_port = port;
+            sip_port = port;
+            if port < 1024 {
+                return config_error("Listening Port must be between 1024 and 65535").into_response();
+            }
+        } else {
+            return config_error("Invalid Listening Port").into_response();
         }
     }
+
+    let mut local_ports = std::collections::HashMap::new();
+    let mut mirror_ports = std::collections::HashMap::new();
+    let mut bridge_ports = std::collections::HashMap::new();
+    let amp_enabled = form_data.contains_key("amp_enabled");
+    let bridge_enabled = form_data.contains_key("bridge_enabled");
+
+    for id in 1..=12 {
+        let label_key = format!("label_{}", id);
+        let target_ip_key = format!("target_ip_{}", id);
+        let target_port_key = format!("target_port_{}", id);
+        let local_port_key = format!("local_port_{}", id);
+        let amp_channel_enabled_key = format!("amp_channel_enabled_{}", id);
+        let amp_port_key = format!("amp_port_{}", id);
+
+        let ch_opt = lock.channels.iter().find(|c| c.id == id);
+        let is_routing_or_dialing = if let Some(ch) = ch_opt {
+            ch.status == "CONNECTED" || ch.status == "RINGING" || ch.status == "INCOMING"
+        } else {
+            false
+        };
+
+        // Note: if channel is active, the form fields are disabled (so they won't be sent in form_data)
+        let ch_label = if is_routing_or_dialing {
+            ch_opt.map(|c| c.label.clone()).unwrap_or_default()
+        } else if let Some(label) = form_data.get(&label_key) {
+            label.trim().to_string()
+        } else {
+            ch_opt.map(|c| c.label.clone()).unwrap_or_default()
+        };
+
+        if !is_routing_or_dialing && ch_label.is_empty() {
+            return config_error(format!("Channel {:02} Alias cannot be empty", id)).into_response();
+        }
+
+        let ch_target_ip = if is_routing_or_dialing {
+            ch_opt.map(|c| c.target_ip.clone()).unwrap_or_default()
+        } else if let Some(ip) = form_data.get(&target_ip_key) {
+            ip.trim().to_string()
+        } else {
+            ch_opt.map(|c| c.target_ip.clone()).unwrap_or_default()
+        };
+
+        if !is_routing_or_dialing && ch_target_ip.is_empty() {
+            return config_error(format!("Channel {:02} Destination IP cannot be empty", id)).into_response();
+        }
+
+        let _ch_target_port = if is_routing_or_dialing {
+            ch_opt.map(|c| c.target_port).unwrap_or(0)
+        } else if let Some(port_str) = form_data.get(&target_port_key) {
+            if let Ok(port) = port_str.parse::<u16>() {
+                if port < 1 {
+                    return config_error(format!("Channel {:02} Destination Port must be between 1 and 65535", id)).into_response();
+                }
+                port
+            } else {
+                return config_error(format!("Invalid Destination Port for Channel {:02}", id)).into_response();
+            }
+        } else {
+            ch_opt.map(|c| c.target_port).unwrap_or(0)
+        };
+
+        let ch_local_port = if is_routing_or_dialing {
+            ch_opt.and_then(|c| c.local_port)
+        } else if let Some(port_str) = form_data.get(&local_port_key) {
+            if port_str.is_empty() {
+                None
+            } else if let Ok(port) = port_str.parse::<u16>() {
+                if port < 1024 {
+                    return config_error(format!("Channel {:02} Local Port must be between 1024 and 65535", id)).into_response();
+                }
+                Some(port)
+            } else {
+                return config_error(format!("Invalid Local Port for Channel {:02}", id)).into_response();
+            }
+        } else {
+            ch_opt.and_then(|c| c.local_port)
+        };
+
+        if let Some(port) = ch_local_port {
+            if port == sip_port {
+                return config_error(format!("Channel {:02} Local Port ({}) conflicts with SIP Listening Port", id, port)).into_response();
+            }
+            if let Some(other_id) = local_ports.insert(port, id) {
+                return config_error(format!("Duplicate Local Port ({}) between Channel {:02} and Channel {:02}", port, other_id, id)).into_response();
+            }
+        }
+
+        let ch_amp_enabled = form_data.contains_key(&amp_channel_enabled_key);
+        let ch_amp_port = if let Some(port_str) = form_data.get(&amp_port_key) {
+            port_str.parse::<u16>().unwrap_or(0)
+        } else {
+            ch_opt.map(|c| c.amp_port).unwrap_or(0)
+        };
+
+        if amp_enabled && ch_amp_enabled {
+            if ch_amp_port < 1 {
+                return config_error(format!("Channel {:02} Mirror Port must be between 1 and 65535 when mirroring is enabled", id)).into_response();
+            }
+            if let Some(other_id) = mirror_ports.insert(ch_amp_port, id) {
+                return config_error(format!("Duplicate Mirror Port ({}) between Channel {:02} and Channel {:02}", ch_amp_port, other_id, id)).into_response();
+            }
+        }
+
+        let bridge_channel_enabled_key = format!("bridge_channel_enabled_{}", id);
+        let bridge_port_key = format!("bridge_port_{}", id);
+        let ch_bridge_enabled = form_data.contains_key(&bridge_channel_enabled_key);
+        let ch_bridge_port = if let Some(port_str) = form_data.get(&bridge_port_key) {
+            port_str.parse::<u16>().unwrap_or(0)
+        } else {
+            ch_opt.map(|c| c.bridge_port).unwrap_or(0)
+        };
+
+        if bridge_enabled && ch_bridge_enabled {
+            if ch_bridge_port < 1 {
+                return config_error(format!("Channel {:02} AMP Bridge Port must be between 1 and 65535 when AMP Bridge is enabled", id)).into_response();
+            }
+            if let Some(other_id) = bridge_ports.insert(ch_bridge_port, id) {
+                return config_error(format!("Duplicate AMP Bridge Port ({}) between Channel {:02} and Channel {:02}", ch_bridge_port, other_id, id)).into_response();
+            }
+        }
+
+        // AMP Bridge local port: the port this console binds to and tells the
+        // interop peer to send its RTP to. Shares the `local_ports` collision map
+        // with the primary channel's own Local Port field since both are real
+        // local binds on this machine.
+        let bridge_local_port_key = format!("bridge_local_port_{}", id);
+        let ch_bridge_local_port = if let Some(port_str) = form_data.get(&bridge_local_port_key) {
+            if port_str.trim().is_empty() {
+                None
+            } else if let Ok(port) = port_str.parse::<u16>() {
+                if port < 1024 {
+                    return config_error(format!("Channel {:02} AMP Bridge Local Port must be between 1024 and 65535", id)).into_response();
+                }
+                Some(port)
+            } else {
+                return config_error(format!("Invalid AMP Bridge Local Port for Channel {:02}", id)).into_response();
+            }
+        } else {
+            ch_opt.and_then(|c| c.bridge_local_port)
+        };
+
+        if let Some(port) = ch_bridge_local_port {
+            if port == sip_port {
+                return config_error(format!("Channel {:02} AMP Bridge Local Port ({}) conflicts with SIP Listening Port", id, port)).into_response();
+            }
+            if let Some(other_id) = local_ports.insert(port, id) {
+                return config_error(format!("Duplicate Local Port ({}) between Channel {:02} and Channel {:02}", port, other_id, id)).into_response();
+            }
+        }
+    }
+
+    // Validate + build the 4 fixed Dispatcher patch groups. Each group's mirror
+    // is its own independent external destination (same as A-MP/AMP Bridge's
+    // per-channel destinations), so collisions are only checked between the
+    // Dispatcher groups themselves, not against the per-channel amp/bridge maps.
+    let mut dispatch_mirror_ports: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+    let mut new_dispatch_groups: Vec<DispatchGroup> = Vec::new();
+    for gid in 1..=DISPATCH_GROUP_COUNT {
+        let name = form_data.get(&format!("dispatch_name_{}", gid))
+            .map(|s| { let mut t = s.trim().to_string(); t.truncate(24); t })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("Patch {}", gid));
+
+        // Membership is managed exclusively via the instant matrix toggle
+        // endpoint (/api/dispatch/toggle) now, not this form — the matrix UI
+        // has no `dispatch_member_*` checkboxes to submit. Preserve whatever
+        // the current roster already is so a routine "Apply Configuration"
+        // (e.g. just renaming a group or changing the SIP port) can't
+        // accidentally wipe out live patches.
+        let member_ids = lock.dispatch_groups.iter().find(|g| g.id == gid).map(|g| g.member_ids.clone()).unwrap_or_default();
+
+        let mirror_enabled = form_data.contains_key(&format!("dispatch_mirror_enabled_{}", gid));
+        let mirror_ip = form_data.get(&format!("dispatch_mirror_ip_{}", gid))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let mirror_port = form_data.get(&format!("dispatch_mirror_port_{}", gid))
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+
+        if mirror_enabled {
+            if mirror_port < 1 {
+                return config_error(format!("Dispatcher Group {} Mirror Port must be between 1 and 65535 when the mirror is enabled", gid)).into_response();
+            }
+            if let Some(other_gid) = dispatch_mirror_ports.insert(mirror_port, gid) {
+                return config_error(format!("Duplicate Dispatcher Mirror Port ({}) between Group {} and Group {}", mirror_port, other_gid, gid)).into_response();
+            }
+        }
+
+        // Mirror local port: the port THIS console binds to and tells the
+        // external party (e.g. a two-way headset resource) to send its RTP to,
+        // so it can talk back into the whole patch. It's a real local bind, so
+        // it shares the `local_ports` collision map with every per-channel
+        // Local Port / Bridge Local Port field validated above.
+        let mirror_local_port_key = format!("dispatch_mirror_local_port_{}", gid);
+        let mirror_local_port = if let Some(port_str) = form_data.get(&mirror_local_port_key) {
+            if port_str.trim().is_empty() {
+                None
+            } else if let Ok(port) = port_str.parse::<u16>() {
+                if port < 1024 {
+                    return config_error(format!("Dispatcher Group {} Local Port must be between 1024 and 65535", gid)).into_response();
+                }
+                Some(port)
+            } else {
+                return config_error(format!("Invalid Dispatcher Group {} Local Port", gid)).into_response();
+            }
+        } else {
+            None
+        };
+
+        if let Some(port) = mirror_local_port {
+            if port == sip_port {
+                return config_error(format!("Dispatcher Group {} Local Port ({}) conflicts with primary Listening Port", gid, port)).into_response();
+            }
+            // Values >100 in `local_ports` are Dispatcher group markers (100+gid),
+            // real channel ids are 1-12 — used only to make the collision message
+            // readable for both cases.
+            if let Some(other_id) = local_ports.insert(port, 100 + gid) {
+                let other_desc = if other_id > 100 {
+                    format!("Dispatcher Group {}", other_id - 100)
+                } else {
+                    format!("Channel {:02}", other_id)
+                };
+                return config_error(format!("Duplicate Local Port ({}) between Dispatcher Group {} and {}", port, gid, other_desc)).into_response();
+            }
+        }
+
+        new_dispatch_groups.push(DispatchGroup {
+            id: gid,
+            name,
+            member_ids,
+            mirror_enabled,
+            mirror_ip,
+            mirror_port,
+            mirror_local_port,
+        });
+    }
+
+    // Parse general settings after validation is complete
+    lock.sip_port = sip_port;
     if let Some(device) = form_data.get("selected_device") {
         if device == "none" || device.is_empty() {
             lock.selected_device = None;
@@ -4259,8 +5975,22 @@ async fn save_config_handler(
         }
     }
 
-    // A-MP global master switch (checkbox present only when ticked)
-    lock.amp_enabled = form_data.contains_key("amp_enabled");
+    // global mirror enabled
+    lock.amp_enabled = amp_enabled;
+    // global ACU bridge enabled
+    lock.bridge_enabled = bridge_enabled;
+    // Dispatcher patch groups (fixed 4 slots)
+    lock.dispatch_groups = new_dispatch_groups;
+    // Any live shared group-mirror tap/listener reflects the OLD settings;
+    // drop them so the next connecting member lazily rebuilds against the new
+    // ip/port/local port (see get_or_create_dispatch_mirror). Existing calls'
+    // per-member relay tasks/buses are untouched — only the external mirror
+    // leg is affected, and only takes effect for members that (re)connect
+    // after this save.
+    for (_, handle) in lock.dispatch_mirror_listeners.drain() {
+        handle.abort();
+    }
+    lock.dispatch_mirror_taps.clear();
 
     // Parse channel settings
     for id in 1..=12 {
@@ -4297,6 +6027,7 @@ async fn save_config_handler(
                 ch.srtp_enabled = form_data.contains_key(&format!("srtp_enabled_{}", id));
                 ch.sip_auth_required = form_data.contains_key(&format!("sip_auth_required_{}", id));
                 ch.amp_enabled = form_data.contains_key(&format!("amp_channel_enabled_{}", id));
+                ch.bridge_enabled = form_data.contains_key(&format!("bridge_channel_enabled_{}", id));
 
                 // Recompute computed target_uri for frontend / telemetry
                 ch.target_uri = if ch.protocol == "RTP" {
@@ -4318,14 +6049,30 @@ async fn save_config_handler(
                 }
             }
 
-            // A-MP per-channel recorder destination — editable regardless of call
-            // state (only affects the NEXT call's mirror, not the live audio path).
+            // per-channel recorder destination — editable regardless of call state
             if let Some(ip) = form_data.get(&format!("amp_ip_{}", id)) {
                 ch.amp_ip = if ip.trim().is_empty() { "127.0.0.1".to_string() } else { ip.trim().to_string() };
             }
             if let Some(port_str) = form_data.get(&format!("amp_port_{}", id)) {
                 if let Ok(p) = port_str.parse::<u16>() {
                     ch.amp_port = p;
+                }
+            }
+
+            // per-channel ACU bridge destination — editable regardless of call state
+            if let Some(ip) = form_data.get(&format!("bridge_ip_{}", id)) {
+                ch.bridge_ip = if ip.trim().is_empty() { "127.0.0.1".to_string() } else { ip.trim().to_string() };
+            }
+            if let Some(port_str) = form_data.get(&format!("bridge_port_{}", id)) {
+                if let Ok(p) = port_str.parse::<u16>() {
+                    ch.bridge_port = p;
+                }
+            }
+            if let Some(port_str) = form_data.get(&format!("bridge_local_port_{}", id)) {
+                if port_str.trim().is_empty() {
+                    ch.bridge_local_port = None;
+                } else if let Ok(p) = port_str.parse::<u16>() {
+                    ch.bridge_local_port = Some(p);
                 }
             }
 
@@ -4345,12 +6092,18 @@ async fn save_config_handler(
             "sipPort": lock.sip_port.to_string(),
             "selectedDevice": lock.selected_device.clone().unwrap_or_default(),
             "localIp": get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
-            "ampEnabled": lock.amp_enabled
+            "ampEnabled": lock.amp_enabled,
+            "bridgeEnabled": lock.bridge_enabled
         }
     }).to_string();
     let _ = lock.tx.send(config_msg);
 
-    // Update A-MP streaming status dynamically based on current configuration
+    // Update mirror streaming status dynamically based on current configuration.
+    // Note: unlike A-MP (a passive tap that config alone fully determines),
+    // `bridge_connected` reflects a live, two-way task started at call time —
+    // it is intentionally NOT recomputed here, since flipping it without the
+    // matching bridge_listener task actually running would show a misleading
+    // "connected" indicator. It is only ever set by the call lifecycle handlers.
     let amp_enabled = lock.amp_enabled;
     let tx = lock.tx.clone();
     for ch in lock.channels.iter_mut() {
@@ -4368,8 +6121,21 @@ async fn save_config_handler(
     // Persist configuration to disk
     save_state_to_file(&lock);
 
-    // Redirect to /config with success query
-    Redirect::to("/config?saved=true")
+    // Respond with JSON so the client can apply it without a full page reload.
+    (StatusCode::OK, Json(serde_json::json!({
+        "success": true,
+        "message": "Configuration saved successfully and synced to console panel."
+    }))).into_response()
+}
+
+/// Build a JSON error response for the web config save endpoint. Replaces the
+/// old query-string `Redirect::to("/config?error=...")` flow now that saving
+/// happens via fetch() and shows a toast instead of reloading the page.
+fn config_error(msg: impl Into<String>) -> axum::response::Response {
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+        "success": false,
+        "error": msg.into()
+    }))).into_response()
 }
 
 fn get_local_ip() -> Option<String> {
@@ -4389,7 +6155,8 @@ async fn get_config_handler(
             "sipPort": lock.sip_port.to_string(),
             "selectedDevice": lock.selected_device.clone().unwrap_or_default(),
             "localIp": get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
-            "ampEnabled": lock.amp_enabled
+            "ampEnabled": lock.amp_enabled,
+            "bridgeEnabled": lock.bridge_enabled
         })),
     )
 }
