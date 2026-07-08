@@ -1367,6 +1367,20 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Deterministic per-channel RTP SSRC for the channel's *primary operator stream*
+/// to its primary target (the ACU Z / RSP-Z2 or other radio/console it calls).
+///
+/// The keyed PTT-ON establishment burst, live mic/PTT audio, and the idle
+/// keep-alive — all emitted by the one mic TX task — share this single SSRC so
+/// the far end sees one continuous stream: the burst keys/establishes the link,
+/// and the keep-alive holds it. The ACU Z tracks its link per-SSRC, so these
+/// must not drift onto separate SSRCs. (The cosmetic connect tone and the
+/// concurrent Dispatcher/ACU-Bridge forwards deliberately use their own SSRCs —
+/// they are independent senders and must not collide with this stream.)
+fn channel_rtp_ssrc(channel_id: u32) -> u32 {
+    0xAC00_0000 | (channel_id & 0x00FF_FFFF)
+}
+
 /// Aborts the wrapped task when this guard is dropped. Lets a child task's
 /// lifetime piggyback on a parent task: when the parent future is dropped
 /// (e.g. the ACU Bridge listener task is aborted at call teardown), the guard's
@@ -1444,6 +1458,13 @@ impl RecordingTap {
 // gives the operator on that end an audible "connected" cue.
 // ============================================================================
 
+/// Duration (ms) of the connected tone sent when a leg opens. Also serves as the
+/// ACU Z / RSP-Z2 stream-establishment burst: it must be long enough for the far
+/// end to lock onto the RTP SSRC before the stream drops to the (empty) idle
+/// keep-alive. Bumped from 300 ms → 1000 ms so a full second of continuous audio
+/// establishes the link. Must be a multiple of 20 ms.
+const CONNECTED_TONE_MS: u32 = 1000;
+
 /// Generate a short tone as 20ms (160-sample) µ-law frames at 8kHz — the same
 /// framing as the live TX audio path. `duration_ms` should be a multiple of
 /// 20 for a clean frame count.
@@ -1473,9 +1494,13 @@ fn generate_connected_tone_frames(freq_hz: f64, duration_ms: u32) -> Vec<[u8; 16
 /// (used for the main leg), paced at 20ms/frame like live audio, with its own
 /// header/seq/ts/ssrc and the marker bit set on the first frame.
 async fn send_connected_tone(socket: &tokio::net::UdpSocket, dest: &str) {
-    let frames = generate_connected_tone_frames(1000.0, 300);
+    let frames = generate_connected_tone_frames(1000.0, CONNECTED_TONE_MS);
     let mut seq: u16 = rand_u32() as u16;
     let mut ts: u32 = rand_u32();
+    // Cosmetic connect beep only — NOT the ACU Z link-establishment signal (that
+    // is the keyed PTT-ON burst at the start of the mic TX task, which the far end
+    // requires before it will honour keep-alives). Uses its own SSRC so it never
+    // collides with that keyed stream.
     let ssrc: u32 = rand_u32();
 
     for (i, frame) in frames.iter().enumerate() {
@@ -1505,7 +1530,7 @@ async fn send_connected_tone(socket: &tokio::net::UdpSocket, dest: &str) {
 /// Same tone, sent through a RecordingTap (ACU Bridge/RSP-Z2 or A-MP leg),
 /// reusing its own shared seq/ts/ssrc space via `send_ulaw`.
 async fn send_connected_tone_via_tap(tap: &RecordingTap) {
-    let frames = generate_connected_tone_frames(1000.0, 300);
+    let frames = generate_connected_tone_frames(1000.0, CONNECTED_TONE_MS);
     for frame in &frames {
         tap.send_ulaw(frame).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1649,6 +1674,11 @@ fn start_bridge_listener(
         let mut resampler_out = PlaybackResampler::new(8000, out_sample_rate);
         let mut limiter = AudioLimiter::new();
         let mut buf = [0u8; 2048];
+        // Independent SSRC: the ACU-Bridge forward runs as its own task and can
+        // send to the primary target concurrently with the mic/keep-alive stream,
+        // so it must NOT share that stream's SSRC (two senders on one SSRC with
+        // independent seq/ts would corrupt the stream). A distinct SSRC is a
+        // legal second RTP source the far end mixes/plays alongside the primary.
         let fwd_ssrc = rand_u32();
         let mut fwd_seq: u16 = rand_u32() as u16;
         let mut fwd_ts: u32 = rand_u32();
@@ -1967,6 +1997,11 @@ fn start_dispatch_relay(
     let task = tokio::spawn(async move {
         let mut resampler_out = PlaybackResampler::new(8000, out_sample_rate);
         let mut limiter = AudioLimiter::new();
+        // Independent SSRC: the Dispatcher forward runs as its own task and can send
+        // to the primary target concurrently with the mic/keep-alive stream, so it
+        // must NOT share that stream's SSRC (two senders on one SSRC with independent
+        // seq/ts would corrupt the stream). A distinct SSRC is a legal second RTP
+        // source the far end mixes/plays alongside the primary.
         let fwd_ssrc = rand_u32();
         let mut fwd_seq: u16 = rand_u32() as u16;
         let mut fwd_ts: u32 = rand_u32();
@@ -2084,7 +2119,11 @@ fn start_microphone_rtp(
         let mut pcm_buffer = Vec::new();
         let mut sequence_number: u16 = rand_u32() as u16;
         let mut timestamp: u32 = rand_u32();
-        let ssrc: u32 = rand_u32();
+        // Shared per-channel SSRC: the connected tone, this mic/PTT audio, and the
+        // idle keep-alive all use the SAME SSRC so the ACU Z establishes the link
+        // from the connected tone and the keep-alive holds it — without waiting for
+        // the first PTT. See channel_rtp_ssrc().
+        let ssrc: u32 = channel_rtp_ssrc(channel_id);
 
         // ACU Z / ED-137 radio (e.g. JPS RSP-Z2) keep-alive: these devices drop
         // the RTP link if they receive no packet for ~5 s. The PTT path below only
@@ -2133,7 +2172,61 @@ fn start_microphone_rtp(
                 }
             });
         }
-        
+
+        // ── ACU Z / RSP-Z2 link-establishment burst (keyed PTT-ON) ────────────────
+        // The RSP-Z2 only brings its RTP link "up" once it receives a KEYED
+        // (PTT-ON) ED-137 header; until then it ignores our PTT-off keep-alives, so
+        // the link previously only came up after the operator's first physical PTT
+        // (per the reported symptom). To prime it, send a short keyed burst at call
+        // start: ED-137 PTT-ON header + µ-law SILENCE payload — this keys the far
+        // end briefly to establish the session without transmitting an audible tone
+        // over the air. It shares this stream's SSRC and seq/ts counters, so the
+        // PTT-off keep-alive that follows is seen as the SAME, already-established
+        // stream. Only sent when ED-137 signalling is enabled (the mode the radio
+        // needs); plain non-ED-137 links keep the empty keep-alive that worked before.
+        if ed137_enabled {
+            const ESTABLISH_BURST_MS: u64 = 1000; // keyed priming duration (multiple of 20 ms)
+            let ext_bytes = ed137::encode_ed137b(&ed137::Ed137Fields {
+                ptt_type: ed137::PttType::Normal, // keyed / PTT-ON
+                ptt_id: ed137_ptt_id,
+                ..Default::default()
+            }).to_vec();
+            let payload_start = 12 + ext_bytes.len();
+            let frames = (ESTABLISH_BURST_MS / 20).max(1);
+            for _ in 0..frames {
+                let mut packet = vec![0u8; payload_start + 160];
+                packet[0] = 0x90; // version 2 + extension bit
+                packet[1] = 0x00; // marker 0, PT 0 (PCMU)
+                packet[2] = (sequence_number >> 8) as u8;
+                packet[3] = (sequence_number & 0xFF) as u8;
+                packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
+                packet[8..12].copy_from_slice(&ssrc.to_be_bytes());
+                packet[12..payload_start].copy_from_slice(&ext_bytes);
+                for i in 0..160 {
+                    packet[payload_start + i] = 0xFF; // µ-law silence
+                }
+                if srtp_enabled {
+                    let ctx = secure_context.lock().await;
+                    if let Some(ref keys) = ctx.keys {
+                        let mut payload = packet[payload_start..].to_vec();
+                        if let Ok(tag) = crypto::encrypt_rtp_gcm(keys, sequence_number, timestamp, ssrc, &mut payload) {
+                            let mut pkt = packet[0..payload_start].to_vec();
+                            pkt.extend_from_slice(&payload);
+                            pkt.extend_from_slice(&tag);
+                            let _ = rtp_socket_clone.send_to(&pkt, &rtp_dest_clone).await;
+                        }
+                    }
+                } else {
+                    let _ = rtp_socket_clone.send_to(&packet, &rtp_dest_clone).await;
+                }
+                sequence_number = sequence_number.wrapping_add(1);
+                timestamp = timestamp.wrapping_add(160);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            last_tx_ms = now_millis();
+            println!("[RTP TX Task] ED-137 keyed establishment burst sent to {} ({} ms)", rtp_dest_clone, ESTABLISH_BURST_MS);
+        }
+
         {
             // Standard point-to-point PTT logic
             let mut interval = tokio::time::interval(Duration::from_millis(20));
@@ -2242,25 +2335,29 @@ fn start_microphone_rtp(
                         last_tx_ms = now_millis();
                     } else {
                         // ── Idle keep-alive to the primary target (ACU Z / RSP-Z2) ──
-                        // PTT is not keyed, so no audio is being transmitted. To stop the
-                        // ACU Z / ED-137 radio from tearing down the link after ~5 s of
-                        // silence, send one PTT-off frame with a µ-law *silence* payload
-                        // every ~3 s. It reuses this stream's seq/ts/ssrc and the same
-                        // ED-137 extension already built above (which encodes PTT=Off when
-                        // idle), so the far end sees one continuous, well-formed RTP flow
-                        // — and, being silence with PTT off, it neither keys the radio nor
-                        // is audible. (A bare payload-less "empty RTP" packet was avoided
-                        // because ED-137 radios commonly ignore it for link-liveness.)
+                        // PTT is not keyed, so no audio is being transmitted. The ACU Z /
+                        // ED-137 radio tears down the link after ~5 s with no RTP, so every
+                        // ~3 s we send an EMPTY-payload RTP keep-alive: the header (+ ED-137
+                        // extension when enabled) with NO audio bytes after it.
+                        //
+                        // `packet[0..payload_start]` = 12-byte RTP header, plus the ED-137
+                        // PTT-off extension already built above when ED-137 is on. This is
+                        // the important fix over a bare `packet[0..12]`: when ED-137 is
+                        // enabled the header's extension bit (0x90) is set, so a 12-byte-only
+                        // packet would claim an extension that isn't there and the Z2 would
+                        // drop it as malformed — which is why the link only came up AFTER the
+                        // first PTT (the first real, valid packet). Including the extension
+                        // makes every keep-alive a valid ED-137 PTT-off packet from call
+                        // start. No audio payload → no RX "beeping". (When ED-137 is off,
+                        // payload_start == 12, so this is exactly the original empty-RTP
+                        // keep-alive that worked before.)
                         let now = now_millis();
                         if now.saturating_sub(last_tx_ms) >= KEEPALIVE_IDLE_MS {
-                            // Overwrite the (unsent) mic payload with µ-law silence (0xFF).
-                            for i in 0..160 {
-                                packet[payload_start + i] = 0xFF;
-                            }
                             if srtp_enabled {
                                 let ctx = secure_context.lock().await;
                                 if let Some(ref keys) = ctx.keys {
-                                    let mut payload = packet[payload_start..].to_vec();
+                                    // Encrypt an empty payload; append only the GCM tag.
+                                    let mut payload: Vec<u8> = Vec::new();
                                     if let Ok(tag) = crypto::encrypt_rtp_gcm(keys, sequence_number, timestamp, ssrc, &mut payload) {
                                         let mut srtp_packet = packet[0..payload_start].to_vec();
                                         srtp_packet.extend_from_slice(&payload);
@@ -2269,7 +2366,7 @@ fn start_microphone_rtp(
                                     }
                                 }
                             } else {
-                                let _ = rtp_socket_clone.send_to(&packet, &rtp_dest_clone).await;
+                                let _ = rtp_socket_clone.send_to(&packet[0..payload_start], &rtp_dest_clone).await;
                             }
                             last_tx_ms = now;
                         }
