@@ -36,8 +36,18 @@ export interface ChannelState {
   bridgeLocalPort?: number;
   /** Runtime status: true while a live two-way ACU Bridge leg is up for this call. */
   bridgeConnected?: boolean;
+  /** Runtime status: true while the ACU Bridge keepalive has confirmed the RTP link is live (valid RTP from the ACU Z seen within the last few seconds). Distinct from bridgeConnected. */
+  bridgeLinkAlive?: boolean;
   /** Runtime status: true while this channel is actively patched into a Dispatcher group with a live call. */
   dispatchConnected?: boolean;
+  /** ED-137 (EUROCAE VoIP-ATM Radio interop standard): tag outgoing RTP with the ED-137A/B/C PTT/SQU header extension for a real radio/VCS. */
+  ed137Enabled?: boolean;
+  /** PTT source id (0-63) this channel identifies itself as in the ED-137 extension word. */
+  ed137PttId?: number;
+  /** Runtime status: true while the most recently received ED-137 extension reported squelch (carrier present) from the radio. */
+  ed137RemoteSquelch?: boolean;
+  /** Runtime status: true while the most recently received ED-137 extension reported a keyed PTT from the far end. */
+  ed137RemotePtt?: boolean;
 }
 
 export interface GlobalSettings {

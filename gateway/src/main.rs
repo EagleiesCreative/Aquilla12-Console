@@ -69,6 +69,7 @@ async fn get_audio_devices_handler() -> impl IntoResponse {
 struct Asset;
 
 mod crypto;
+mod ed137;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChannelConfig {
@@ -89,6 +90,15 @@ struct ChannelConfig {
     srtp_enabled: bool,
     #[serde(rename = "sipAuthRequired")]
     sip_auth_required: bool,
+    // ED-137 (EUROCAE VoIP-ATM Radio interoperability standard) — when enabled,
+    // this channel's RTP carries the ED-137A/B/C PTT/SQU header extension so it
+    // can key/receive a real radio or VCS instead of plain unsignalled RTP.
+    #[serde(rename = "ed137Enabled", default)]
+    ed137_enabled: bool,
+    // PTT source id (0-63) this channel identifies itself as in the ED-137
+    // extension word.
+    #[serde(rename = "ed137PttId", default)]
+    ed137_ptt_id: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +133,8 @@ fn load_config() -> GatewayConfig {
             volume: 100,
             srtp_enabled: true,
             sip_auth_required: true,
+            ed137_enabled: false,
+            ed137_ptt_id: 0,
         })
         .collect();
     
@@ -180,6 +192,18 @@ struct Channel {
     srtp_enabled: bool,
     #[serde(rename = "sipAuthRequired")]
     sip_auth_required: bool,
+    #[serde(rename = "ed137Enabled")]
+    ed137_enabled: bool,
+    #[serde(rename = "ed137PttId")]
+    ed137_ptt_id: u8,
+    /// Runtime status: true while the most recent inbound ED-137 extension on
+    /// this channel reported squelch (carrier/signal present) from the radio.
+    #[serde(rename = "ed137RemoteSquelch")]
+    ed137_remote_squelch: bool,
+    /// Runtime status: true while the most recent inbound ED-137 extension on
+    /// this channel reported a keyed PTT type (i.e. the far end is talking).
+    #[serde(rename = "ed137RemotePtt")]
+    ed137_remote_ptt: bool,
     #[serde(skip)]
     secure_context: Arc<tokio::sync::Mutex<crypto::SecureChannelContext>>,
 }
@@ -236,6 +260,8 @@ fn save_state_to_file(state: &AppState) {
         volume: ch.volume,
         srtp_enabled: ch.srtp_enabled,
         sip_auth_required: ch.sip_auth_required,
+        ed137_enabled: ch.ed137_enabled,
+        ed137_ptt_id: ch.ed137_ptt_id,
     }).collect();
 
     let config = GatewayConfig {
@@ -288,6 +314,10 @@ async fn main() {
             volume: ch_cfg.volume,
             srtp_enabled: ch_cfg.srtp_enabled,
             sip_auth_required: ch_cfg.sip_auth_required,
+            ed137_enabled: ch_cfg.ed137_enabled,
+            ed137_ptt_id: ch_cfg.ed137_ptt_id,
+            ed137_remote_squelch: false,
+            ed137_remote_ptt: false,
             secure_context: Arc::new(tokio::sync::Mutex::new(crypto::SecureChannelContext::new())),
         }
     }).collect::<Vec<_>>();
@@ -1034,12 +1064,14 @@ fn start_microphone_rtp(
     // Spawn async network sender task
     let sender_task = tokio::spawn(async move {
         let state_sender = Arc::clone(&state_clone);
-        let (srtp_enabled, secure_context) = {
+        let (srtp_enabled, secure_context, ed137_enabled, ed137_ptt_id) = {
             let app_state = state_sender.lock().await;
             let ch = app_state.channels.iter().find(|c| c.id == channel_id);
             let srtp = ch.map(|c| c.srtp_enabled).unwrap_or(false);
             let s_ctx = ch.map(|c| Arc::clone(&c.secure_context)).unwrap();
-            (srtp, s_ctx)
+            let ed137 = ch.map(|c| c.ed137_enabled).unwrap_or(false);
+            let ed137_id = ch.map(|c| c.ed137_ptt_id).unwrap_or(0);
+            (srtp, s_ctx, ed137, ed137_id)
         };
 
         let sample_rate = {
@@ -1130,29 +1162,49 @@ fn start_microphone_rtp(
                     }).sum();
                     let rms = (sum_squares / 160.0).sqrt();
                     let audio_level = (rms * 500.0).clamp(0.0, 100.0) as u32;
-                    
-                    let mut packet = vec![0u8; 12 + 160];
-                    packet[0] = 0x80;
+
+                    let ptt_on = ptt_active_clone.load(Ordering::SeqCst);
+
+                    // ED-137A/B/C RTP header extension: carries PTT/SQU signalling so
+                    // a real radio/VCS on the other end can key/receive properly,
+                    // instead of plain unsignalled RTP. Opt-in per channel.
+                    let ext_bytes: Vec<u8> = if ed137_enabled {
+                        ed137::encode_ed137b(&ed137::Ed137Fields {
+                            ptt_type: if ptt_on { ed137::PttType::Normal } else { ed137::PttType::Off },
+                            ptt_id: ed137_ptt_id,
+                            ..Default::default()
+                        }).to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let ext_len = ext_bytes.len();
+                    let payload_start = 12 + ext_len;
+
+                    let mut packet = vec![0u8; payload_start + 160];
+                    packet[0] = if ext_len > 0 { 0x90 } else { 0x80 }; // version 2, extension bit if ED-137 is on
                     packet[1] = 0x00;
-                    
+
                     packet[2] = (sequence_number >> 8) as u8;
                     packet[3] = (sequence_number & 0xFF) as u8;
-                    
+
                     packet[4] = (timestamp >> 24) as u8;
                     packet[5] = ((timestamp >> 16) & 0xFF) as u8;
                     packet[6] = ((timestamp >> 8) & 0xFF) as u8;
                     packet[7] = (timestamp & 0xFF) as u8;
-                    
+
                     packet[8] = (ssrc >> 24) as u8;
                     packet[9] = ((ssrc >> 16) & 0xFF) as u8;
                     packet[10] = ((ssrc >> 8) & 0xFF) as u8;
                     packet[11] = (ssrc & 0xFF) as u8;
-                    
-                    for i in 0..160 {
-                        packet[12 + i] = linear_to_ulaw(chunk_160[i]);
+
+                    if ext_len > 0 {
+                        packet[12..payload_start].copy_from_slice(&ext_bytes);
                     }
-                    
-                    let ptt_on = ptt_active_clone.load(Ordering::SeqCst);
+
+                    for i in 0..160 {
+                        packet[payload_start + i] = linear_to_ulaw(chunk_160[i]);
+                    }
+
                     let now = tokio::time::Instant::now();
                     // If PTT has been idle for 5s+, still fire a silent RTP burst so the
                     // far-end (JPS) RTP watchdog keeps seeing packets and doesn't flag the
@@ -1160,12 +1212,15 @@ fn start_microphone_rtp(
                     let due_for_keepalive = !ptt_on && now.duration_since(last_sent) >= Duration::from_secs(5);
 
                     if ptt_on || due_for_keepalive {
-                        // Real mic bytes when PTT is pressed; silence (µ-law digital-zero)
-                        // for the periodic keep-alive so an idle mic never leaks audio.
+                        // Real mic bytes when PTT is pressed; NO payload for the periodic
+                        // keep-alive — a keepalive is a bare RTP header (V2, 12 bytes, plus
+                        // any ED-137 extension) with an empty payload. This matches the
+                        // desktop app's keepalive (send_keepalive / packet[0..payload_start])
+                        // and keeps an idle mic from ever leaking audio onto the wire.
                         let out_payload: Vec<u8> = if ptt_on {
-                            packet[12..].to_vec()
+                            packet[payload_start..].to_vec()
                         } else {
-                            vec![linear_to_ulaw(0); 160]
+                            Vec::new()
                         };
 
                         let sent = if srtp_enabled {
@@ -1173,7 +1228,9 @@ fn start_microphone_rtp(
                             if let Some(ref keys) = ctx.keys {
                                 let mut payload = out_payload;
                                 if let Ok(tag) = crypto::encrypt_rtp_gcm(keys, sequence_number, timestamp, ssrc, &mut payload) {
-                                    let mut srtp_packet = packet[0..12].to_vec();
+                                    // Keepalive: header + auth tag only (encrypted payload is
+                                    // empty). PTT: header + encrypted payload + tag.
+                                    let mut srtp_packet = packet[0..payload_start].to_vec();
                                     srtp_packet.extend_from_slice(&payload);
                                     srtp_packet.extend_from_slice(&tag);
                                     let _ = rtp_socket_clone.send_to(&srtp_packet, &rtp_dest_clone).await;
@@ -1185,7 +1242,9 @@ fn start_microphone_rtp(
                                 false
                             }
                         } else {
-                            let mut out_packet = packet[0..12].to_vec();
+                            // Keepalive: out_payload is empty, so this sends just the bare
+                            // RTP header (packet[0..payload_start]).
+                            let mut out_packet = packet[0..payload_start].to_vec();
                             out_packet.extend_from_slice(&out_payload);
                             let _ = rtp_socket_clone.send_to(&out_packet, &rtp_dest_clone).await;
                             true
@@ -1194,7 +1253,7 @@ fn start_microphone_rtp(
                         if sent {
                             last_sent = now;
                             if due_for_keepalive {
-                                println!("[RTP Keep-Alive] No PTT audio for 5s — sent silence burst to {} to hold link status", rtp_dest_clone);
+                                println!("[RTP Keep-Alive] No PTT audio for 5s — sent bare RTP header ({}b, no payload) to {} to hold link status", payload_start, rtp_dest_clone);
                             }
                         }
                     }
@@ -1524,6 +1583,9 @@ fn start_audio_playback(
     // 2. Spawn the tokio task to receive incoming RTP UDP packets, decode, and route accordingly
     let rtp_socket_clone = Arc::clone(&rtp_socket);
     let queue_write = Arc::clone(&queue);
+    // Cloned so we can update this channel's ED-137 remote PTT/squelch status
+    // (and broadcast it) as extensions arrive, without moving the outer `state`.
+    let state_rx = Arc::clone(&state);
 
     let rx_task = tokio::spawn(async move {
         let mut resampler = PlaybackResampler::new(8000, sample_rate);
@@ -1556,13 +1618,41 @@ fn start_audio_playback(
                         }
                         
                         if version == 2 && payload_type == 0 {
+                            // The RTP header + any extension (including an ED-137 PTT/SQU
+                            // block) travels in clear even under SRTP — only the payload
+                            // itself is encrypted — so this is always safe to inspect.
+                            if let Some(fields) = ed137::parse_rtp_ed137(&buf[..len]) {
+                                let squ = fields.squ;
+                                let remote_ptt = fields.ptt_type.is_keyed();
+                                let (changed, tx_ws) = {
+                                    let mut app_state = state_rx.lock().await;
+                                    let mut changed = false;
+                                    if let Some(ch) = app_state.channels.iter_mut().find(|c| c.id == channel_id) {
+                                        if ch.ed137_remote_squelch != squ || ch.ed137_remote_ptt != remote_ptt {
+                                            ch.ed137_remote_squelch = squ;
+                                            ch.ed137_remote_ptt = remote_ptt;
+                                            changed = true;
+                                        }
+                                    }
+                                    (changed, app_state.tx.clone())
+                                };
+                                if changed {
+                                    let msg = serde_json::json!({
+                                        "type": "ed137_status",
+                                        "data": { "id": channel_id, "squelch": squ, "remotePtt": remote_ptt }
+                                    }).to_string();
+                                    let _ = tx_ws.send(msg);
+                                }
+                            }
+
+                            let header_len = ed137::rtp_header_len(&buf[..len]).unwrap_or(12);
                             let payload_opt = if srtp_enabled {
                                 let ctx = secure_context.lock().await;
                                 if let Some(ref keys) = ctx.keys {
                                     let seq = ((buf[2] as u16) << 8) | (buf[3] as u16);
                                     let ts = ((buf[4] as u32) << 24) | ((buf[5] as u32) << 16) | ((buf[6] as u32) << 8) | (buf[7] as u32);
                                     let ssrc = ((buf[8] as u32) << 24) | ((buf[9] as u32) << 16) | ((buf[10] as u32) << 8) | (buf[11] as u32);
-                                    let mut payload_cipher = buf[12..len].to_vec();
+                                    let mut payload_cipher = buf[header_len..len].to_vec();
                                     if payload_cipher.len() > 16 {
                                         let tag_start = payload_cipher.len() - 16;
                                         let tag_vec = payload_cipher.split_off(tag_start);
@@ -2452,6 +2542,8 @@ async fn show_config_handler(
 
         let srtp_checked = if ch.srtp_enabled { "checked" } else { "" };
         let sip_auth_checked = if ch.sip_auth_required { "checked" } else { "" };
+        let ed137_checked = if ch.ed137_enabled { "checked" } else { "" };
+        let ed137_ptt_id_val = ch.ed137_ptt_id.to_string();
 
         channels_rows.push_str(&format!(
             r#"
@@ -2474,6 +2566,12 @@ async fn show_config_handler(
                 </td>
                 <td style="text-align: center;">
                     <input type="checkbox" name="sip_auth_required_{}" {} {} style="width: 20px; height: 20px; cursor: pointer;" />
+                </td>
+                <td style="text-align: center;">
+                    <input type="checkbox" name="ed137_enabled_{}" {} {} style="width: 20px; height: 20px; cursor: pointer;" title="ED-137A/B/C PTT/SQU RTP header extension for real radio/VCS interop" />
+                </td>
+                <td>
+                    <input type="number" name="ed137_ptt_id_{}" value="{}" {} style="width: 60px;" min="0" max="63" />
                 </td>
                 <td>
                     <input type="text" name="sip_user_{}" value="{}" {} style="width: 90px;" placeholder="receiver" />
@@ -2514,6 +2612,12 @@ async fn show_config_handler(
             disabled_attr,
             ch.id,
             sip_auth_checked,
+            disabled_attr,
+            ch.id,
+            ed137_checked,
+            disabled_attr,
+            ch.id,
+            ed137_ptt_id_val,
             disabled_attr,
             ch.id,
             html_escape(&sip_user_val),
@@ -2756,6 +2860,8 @@ async fn show_config_handler(
                                     <th style="width: 12%;">Channel Alias</th>
                                     <th style="width: 6%; text-align: center;">SRTP</th>
                                     <th style="width: 6%; text-align: center;">SIP Auth</th>
+                                    <th style="width: 6%; text-align: center;">ED-137</th>
+                                    <th style="width: 6%; text-align: center;">PTT ID</th>
                                     <th style="width: 10%;">SIP User</th>
                                     <th style="width: 14%;">Destination IP</th>
                                     <th style="width: 8%;">Dest Port</th>
@@ -2879,6 +2985,12 @@ async fn save_config_handler(
                 // Checkbox: if present in form payload, it is checked ("on"), otherwise false
                 ch.srtp_enabled = form_data.contains_key(&format!("srtp_enabled_{}", id));
                 ch.sip_auth_required = form_data.contains_key(&format!("sip_auth_required_{}", id));
+                ch.ed137_enabled = form_data.contains_key(&format!("ed137_enabled_{}", id));
+                if let Some(ptt_id_str) = form_data.get(&format!("ed137_ptt_id_{}", id)) {
+                    if let Ok(ptt_id) = ptt_id_str.parse::<u8>() {
+                        ch.ed137_ptt_id = ptt_id.min(63);
+                    }
+                }
 
                 // Recompute computed target_uri for frontend / telemetry
                 ch.target_uri = if ch.protocol == "RTP" {

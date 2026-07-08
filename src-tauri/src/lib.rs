@@ -17,6 +17,7 @@ use rusqlite::Connection;
 
 
 mod crypto;
+mod ed137;
 
 use std::sync::OnceLock;
 use std::sync::Mutex as StdMutex;
@@ -79,6 +80,18 @@ struct ChannelConfig {
     // None = ephemeral (auto-assigned each call, won't be stable across calls).
     #[serde(rename = "bridgeLocalPort", default)]
     bridge_local_port: Option<u16>,
+    // ED-137 (EUROCAE VoIP-ATM Radio interoperability standard) — when enabled,
+    // this channel's RTP carries the ED-137A/B/C PTT/SQU header extension so it
+    // can key/receive a real radio or VCS instead of plain unsignalled RTP.
+    // Opt-in per channel since most legs (other consoles, ACU/A-MP, dispatcher
+    // patches) are not talking to ED-137 equipment.
+    #[serde(rename = "ed137Enabled", default)]
+    ed137_enabled: bool,
+    // PTT source id (0-63) this channel identifies itself as in the ED-137
+    // extension word — corresponds to the radio port/operator id the far-end
+    // VCS/radio expects.
+    #[serde(rename = "ed137PttId", default)]
+    ed137_ptt_id: u8,
 }
 
 fn default_amp_ip() -> String {
@@ -227,6 +240,10 @@ fn init_db(conn: &Connection) {
     // configured with a stable destination (nullable = ephemeral/auto).
     let _ = conn.execute("ALTER TABLE channels ADD COLUMN bridge_local_port INTEGER", []);
 
+    // ED-137 (EUROCAE Radio interop standard) — per-channel opt-in, default off.
+    let _ = conn.execute("ALTER TABLE channels ADD COLUMN ed137_enabled INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE channels ADD COLUMN ed137_ptt_id INTEGER NOT NULL DEFAULT 0", []);
+
     // Ensure we have a default/auto-generated API key, SIP auth credentials, and admin login password
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sip_auth_password', 'securepass123')", []).ok();
     
@@ -298,7 +315,7 @@ fn load_config() -> GatewayConfig {
 
     // Load channels (still read is_conference column for backward compat but ignore it)
     let mut stmt = conn.prepare(
-        "SELECT id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port FROM channels ORDER BY id"
+        "SELECT id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port, ed137_enabled, ed137_ptt_id FROM channels ORDER BY id"
     ).unwrap();
 
     let channels: Vec<ChannelConfig> = stmt.query_map([], |row| {
@@ -322,6 +339,8 @@ fn load_config() -> GatewayConfig {
             bridge_port: row.get::<_, u32>(16).unwrap_or(0) as u16,
             bridge_enabled: row.get::<_, i32>(17).unwrap_or(0) != 0,
             bridge_local_port: row.get::<_, Option<u32>>(18).unwrap_or(None).map(|v| v as u16),
+            ed137_enabled: row.get::<_, i32>(19).unwrap_or(0) != 0,
+            ed137_ptt_id: row.get::<_, u32>(20).unwrap_or(0) as u8,
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -383,8 +402,8 @@ fn save_config(config: &GatewayConfig) {
     conn.execute("BEGIN", []).ok();
     for ch in &config.channels {
         conn.execute(
-            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port, ed137_enabled, ed137_ptt_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             rusqlite::params![
                 ch.id,
                 ch.label,
@@ -404,6 +423,8 @@ fn save_config(config: &GatewayConfig) {
                 ch.bridge_port as u32,
                 ch.bridge_enabled as i32,
                 ch.bridge_local_port.map(|v| v as u32),
+                ch.ed137_enabled as i32,
+                ch.ed137_ptt_id as u32,
             ],
         ).ok();
     }
@@ -470,8 +491,8 @@ fn save_config_to_conn(conn: &Connection, config: &GatewayConfig) {
 
     for ch in &config.channels {
         conn.execute(
-            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port, ed137_enabled, ed137_ptt_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             rusqlite::params![
                 ch.id, ch.label, ch.protocol, ch.target_ip,
                 ch.target_port as u32, ch.sip_user, ch.codec,
@@ -480,6 +501,7 @@ fn save_config_to_conn(conn: &Connection, config: &GatewayConfig) {
                 ch.amp_ip, ch.amp_port as u32, ch.amp_enabled as i32,
                 ch.bridge_ip, ch.bridge_port as u32, ch.bridge_enabled as i32,
                 ch.bridge_local_port.map(|v| v as u32),
+                ch.ed137_enabled as i32, ch.ed137_ptt_id as u32,
             ],
         ).ok();
     }
@@ -506,6 +528,8 @@ fn default_config() -> GatewayConfig {
             bridge_port: 6004 + (id as u16 - 1) * 2,
             bridge_enabled: false,
             bridge_local_port: None,
+            ed137_enabled: false,
+            ed137_ptt_id: 0,
         })
         .collect();
 
@@ -571,9 +595,28 @@ struct Channel {
     bridge_enabled: bool,
     #[serde(rename = "bridgeLocalPort")]
     bridge_local_port: Option<u16>,
+    #[serde(rename = "ed137Enabled")]
+    ed137_enabled: bool,
+    #[serde(rename = "ed137PttId")]
+    ed137_ptt_id: u8,
+    /// Runtime status: true while the most recent inbound ED-137 extension on
+    /// this channel reported squelch (carrier/signal present) from the radio.
+    #[serde(rename = "ed137RemoteSquelch")]
+    ed137_remote_squelch: bool,
+    /// Runtime status: true while the most recent inbound ED-137 extension on
+    /// this channel reported a keyed PTT type (i.e. the far end is talking).
+    #[serde(rename = "ed137RemotePtt")]
+    ed137_remote_ptt: bool,
     /// Runtime status: true while a live two-way ACU bridge leg is up for this call.
     #[serde(rename = "bridgeConnected")]
     bridge_connected: bool,
+    /// Runtime status: true while the ACU Bridge keepalive has confirmed the RTP
+    /// link is live — i.e. valid RTP from the ACU Z has arrived within the last
+    /// few seconds. Distinct from `bridge_connected` (which only means a bridge
+    /// leg/task exists for this call): this reflects the actual health of the
+    /// ACU Z's 5-second keepalive link, and clears to false when it goes stale.
+    #[serde(rename = "bridgeLinkAlive")]
+    bridge_link_alive: bool,
     /// Runtime status: true while this channel is an active Dispatcher patch member
     /// (i.e. it's on a live call AND at least one other member of one of its
     /// Dispatcher groups is also on a live call).
@@ -681,6 +724,8 @@ fn save_state_to_file(state: &AppState) {
         bridge_port: ch.bridge_port,
         bridge_enabled: ch.bridge_enabled,
         bridge_local_port: ch.bridge_local_port,
+        ed137_enabled: ch.ed137_enabled,
+        ed137_ptt_id: ch.ed137_ptt_id,
     }).collect();
 
     let config = GatewayConfig {
@@ -1313,6 +1358,28 @@ fn rand_u64() -> u64 {
 // by the global amp_enabled flag, all held in AppState (editable via Web Config).
 // ============================================================================
 
+/// Milliseconds since the Unix epoch. Used for coarse idle/staleness timing on
+/// the ACU Bridge keepalive + link-status monitor (not for precise scheduling).
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Aborts the wrapped task when this guard is dropped. Lets a child task's
+/// lifetime piggyback on a parent task: when the parent future is dropped
+/// (e.g. the ACU Bridge listener task is aborted at call teardown), the guard's
+/// Drop aborts the child too — so the keepalive/link-monitor task never needs a
+/// separate AbortHandle threaded through every `ActiveCall` literal / teardown
+/// site.
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A per-call sink that re-packetizes µ-law audio into RTP/PCMU for the recorder.
 struct RecordingTap {
     socket: Arc<tokio::net::UdpSocket>,
@@ -1320,6 +1387,10 @@ struct RecordingTap {
     ssrc: u32,
     seq: std::sync::atomic::AtomicU16,
     ts: std::sync::atomic::AtomicU32,
+    /// Unix-millis of the last real audio frame sent through this tap. The ACU
+    /// Bridge keepalive reads this to detect idle gaps and inject a silence
+    /// frame before the ACU Z's 5-second link-establishment window elapses.
+    last_activity_ms: std::sync::atomic::AtomicU64,
 }
 
 impl RecordingTap {
@@ -1343,7 +1414,118 @@ impl RecordingTap {
         packet.extend_from_slice(ulaw);
 
         let _ = self.socket.send_to(&packet, &self.dest).await;
+
+        // Stamp activity so the keepalive monitor knows the leg isn't idle.
+        self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
     }
+
+    /// Send one 20 ms µ-law *silence* frame (160 bytes of 0xFF = digital zero)
+    /// as a well-formed RTP/PCMU packet — the ACU Bridge keepalive. To the ACU Z
+    /// this is indistinguishable from a real (quiet) audio frame, so it holds the
+    /// RTP link "established" during call silence without being audible. Shares
+    /// this tap's seq/ts/ssrc space via `send_ulaw`, keeping the stream contiguous
+    /// (and refreshing `last_activity_ms` so the next keepalive is ~4 s later).
+    async fn send_keepalive_silence(&self) {
+        const ULAW_SILENCE: u8 = 0xFF; // linear 0 encoded as µ-law
+        let frame = [ULAW_SILENCE; 160];
+        self.send_ulaw(&frame).await;
+    }
+}
+
+// ============================================================================
+// Connected tone — a short audible confirmation burst sent as real RTP/PCMU
+// payload the instant a link (main leg or ACU Bridge/RSP-Z2 leg) is opened.
+//
+// A bare empty-payload RTP packet turned out not to be enough: some far-end
+// gear only marks its RTP link "established" once it has actually received
+// an audio payload, not just a header. So instead we generate a brief tone
+// and packetize/send it exactly like live TX audio (same 20ms/160-sample
+// µ-law framing), which both proves the link is live to the far end and
+// gives the operator on that end an audible "connected" cue.
+// ============================================================================
+
+/// Generate a short tone as 20ms (160-sample) µ-law frames at 8kHz — the same
+/// framing as the live TX audio path. `duration_ms` should be a multiple of
+/// 20 for a clean frame count.
+fn generate_connected_tone_frames(freq_hz: f64, duration_ms: u32) -> Vec<[u8; 160]> {
+    const SAMPLE_RATE: f64 = 8000.0;
+    const FRAME_SAMPLES: usize = 160;
+    let total_samples = ((duration_ms as f64 / 1000.0) * SAMPLE_RATE) as usize;
+    let amplitude: f64 = 8000.0; // moderate level — audible cue, not a full-scale blast
+
+    let mut frames = Vec::new();
+    let mut sample_idx = 0usize;
+    while sample_idx < total_samples {
+        let mut frame = [0u8; FRAME_SAMPLES];
+        for (i, slot) in frame.iter_mut().enumerate() {
+            let n = sample_idx + i;
+            let t = n as f64 / SAMPLE_RATE;
+            let s = (amplitude * (2.0 * std::f64::consts::PI * freq_hz * t).sin()) as i16;
+            *slot = linear_to_ulaw(s);
+        }
+        frames.push(frame);
+        sample_idx += FRAME_SAMPLES;
+    }
+    frames
+}
+
+/// Send the connected tone as real RTP/PCMU packets directly on a raw socket
+/// (used for the main leg), paced at 20ms/frame like live audio, with its own
+/// header/seq/ts/ssrc and the marker bit set on the first frame.
+async fn send_connected_tone(socket: &tokio::net::UdpSocket, dest: &str) {
+    let frames = generate_connected_tone_frames(1000.0, 300);
+    let mut seq: u16 = rand_u32() as u16;
+    let mut ts: u32 = rand_u32();
+    let ssrc: u32 = rand_u32();
+
+    for (i, frame) in frames.iter().enumerate() {
+        let mut packet = vec![0u8; 12 + frame.len()];
+        packet[0] = 0x80;
+        packet[1] = if i == 0 { 0x80 } else { 0x00 }; // marker bit on first frame (talkspurt start)
+        packet[2] = (seq >> 8) as u8;
+        packet[3] = (seq & 0xFF) as u8;
+        packet[4] = (ts >> 24) as u8;
+        packet[5] = ((ts >> 16) & 0xFF) as u8;
+        packet[6] = ((ts >> 8) & 0xFF) as u8;
+        packet[7] = (ts & 0xFF) as u8;
+        packet[8] = (ssrc >> 24) as u8;
+        packet[9] = ((ssrc >> 16) & 0xFF) as u8;
+        packet[10] = ((ssrc >> 8) & 0xFF) as u8;
+        packet[11] = (ssrc & 0xFF) as u8;
+        packet[12..].copy_from_slice(frame);
+
+        let _ = socket.send_to(&packet, dest).await;
+
+        seq = seq.wrapping_add(1);
+        ts = ts.wrapping_add(frame.len() as u32);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Same tone, sent through a RecordingTap (ACU Bridge/RSP-Z2 or A-MP leg),
+/// reusing its own shared seq/ts/ssrc space via `send_ulaw`.
+async fn send_connected_tone_via_tap(tap: &RecordingTap) {
+    let frames = generate_connected_tone_frames(1000.0, 300);
+    for frame in &frames {
+        tap.send_ulaw(frame).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Fire the connected tone on the main leg as a detached background task, so
+/// call setup never blocks on the ~300ms send while holding the state lock.
+fn spawn_connected_tone(socket: Arc<tokio::net::UdpSocket>, dest: String) {
+    tokio::spawn(async move {
+        send_connected_tone(&socket, &dest).await;
+    });
+}
+
+/// Fire the connected tone on a RecordingTap (ACU Bridge/RSP-Z2 leg) as a
+/// detached background task, same rationale as `spawn_connected_tone`.
+fn spawn_connected_tone_tap(tap: Arc<RecordingTap>) {
+    tokio::spawn(async move {
+        send_connected_tone_via_tap(&tap).await;
+    });
 }
 
 /// Build a recording tap from already-resolved A-MP (or ACU Bridge) settings.
@@ -1376,6 +1558,7 @@ async fn build_recording_tap(enabled: bool, ip: &str, port: u16, channel_id: u32
                 ssrc: rand_u32(),
                 seq: std::sync::atomic::AtomicU16::new(rand_u32() as u16),
                 ts: std::sync::atomic::AtomicU32::new(rand_u32()),
+                last_activity_ms: std::sync::atomic::AtomicU64::new(now_millis()),
             }))
         }
         Err(e) => {
@@ -1458,8 +1641,11 @@ fn start_bridge_listener(
     primary_rtp_dest: String,
     acu_queue: Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>,
     out_sample_rate: u32,
+    bridge_tap: Arc<RecordingTap>,
+    state: Arc<Mutex<AppState>>,
 ) -> tokio::task::AbortHandle {
     let task = tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
         let mut resampler_out = PlaybackResampler::new(8000, out_sample_rate);
         let mut limiter = AudioLimiter::new();
         let mut buf = [0u8; 2048];
@@ -1467,6 +1653,70 @@ fn start_bridge_listener(
         let mut fwd_seq: u16 = rand_u32() as u16;
         let mut fwd_ts: u32 = rand_u32();
         let max_queue_samples = (out_sample_rate as usize) * 500 / 1000; // cap at 500ms, matches primary jitter buffer ceiling
+
+        // Unix-millis of the last valid RTP/PCMU packet received FROM the ACU peer
+        // (0 = never heard yet). Read by the keepalive/link-status monitor below.
+        let last_rx_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // ── ACU Bridge keepalive + link-status monitor ──────────────────────────
+        // A single 1 Hz task that does two jobs, both driven by the ACU Z's hard
+        // 5-second "link must be (re)established" requirement:
+        //   (1) OUTBOUND keepalive — if the bridge tap has sent no real audio for
+        //       ~4 s (safely under 5 s), inject one µ-law silence frame so the ACU
+        //       Z keeps the RTP link up during call silence.
+        //   (2) INBOUND link status — flip this channel's `bridge_link_alive` (and
+        //       broadcast a `bridge_status` event) based on whether any RTP has
+        //       arrived from the ACU within ~6 s.
+        // Guarded by `AbortOnDrop`: when this listener task is aborted at call
+        // teardown, the monitor is aborted with it — no extra AbortHandle plumbing.
+        let _keepalive_guard = {
+            let tap = Arc::clone(&bridge_tap);
+            let last_rx = Arc::clone(&last_rx_ms);
+            let state = Arc::clone(&state);
+            let dest = primary_rtp_dest.clone();
+            let handle = tokio::spawn(async move {
+                const KEEPALIVE_IDLE_MS: u64 = 4000; // inject silence if idle this long (< 5 s ACU limit)
+                const LINK_STALE_MS: u64 = 6000;     // declare link stale after this long with no inbound RTP
+                let mut prev_alive: Option<bool> = None;
+                let mut tick = tokio::time::interval(Duration::from_millis(1000));
+                loop {
+                    tick.tick().await;
+                    let now = now_millis();
+
+                    // (1) Outbound keepalive during silence.
+                    let idle = now.saturating_sub(tap.last_activity_ms.load(Ordering::Relaxed));
+                    if idle >= KEEPALIVE_IDLE_MS {
+                        tap.send_keepalive_silence().await;
+                    }
+
+                    // (2) Inbound link-alive status (edge-triggered broadcast).
+                    let last = last_rx.load(Ordering::Relaxed);
+                    let alive = last != 0 && now.saturating_sub(last) < LINK_STALE_MS;
+                    if prev_alive != Some(alive) {
+                        prev_alive = Some(alive);
+                        let tx_ws = {
+                            let mut app_state = state.lock().await;
+                            if let Some(ch) = app_state.channels.iter_mut().find(|c| c.id == channel_id) {
+                                ch.bridge_link_alive = alive;
+                            }
+                            app_state.tx.clone()
+                        };
+                        let msg = serde_json::json!({
+                            "type": "bridge_status",
+                            "data": { "id": channel_id, "linkAlive": alive }
+                        }).to_string();
+                        let _ = tx_ws.send(msg);
+                        println!(
+                            "[ACU Bridge] Channel {} keepalive link {} (peer {})",
+                            channel_id,
+                            if alive { "ALIVE — RTP from ACU within 6s" } else { "STALE — no RTP from ACU" },
+                            dest
+                        );
+                    }
+                }
+            });
+            AbortOnDrop(handle.abort_handle())
+        };
 
         println!("[ACU Bridge] Channel {} bridge RX task active (forwarding to {})", channel_id, primary_rtp_dest);
 
@@ -1481,6 +1731,10 @@ fn start_bridge_listener(
                     if version != 2 || payload_type != 0 {
                         continue;
                     }
+                    // Any valid RTP/PCMU from the ACU (even an empty-payload keepalive
+                    // of its own) proves the link is live — stamp before the payload
+                    // emptiness check below so silent keepalives still count.
+                    last_rx_ms.store(now_millis(), Ordering::Relaxed);
                     let payload = match parse_rtp_payload(&buf[..len]) {
                         Some(p) if !p.is_empty() => p.to_vec(),
                         _ => continue,
@@ -1798,14 +2052,17 @@ fn start_microphone_rtp(
     let device_name_clone = device_name.clone();
     let ptt_active_clone = Arc::clone(&ptt_active);
     let call_id_clone = call_id.clone();
+
     let sender_task = tokio::spawn(async move {
         let state_sender = Arc::clone(&state_clone);
-        let (srtp_enabled, secure_context) = {
+        let (srtp_enabled, secure_context, ed137_enabled, ed137_ptt_id) = {
             let app_state = state_sender.lock().await;
             let ch = app_state.channels.iter().find(|c| c.id == channel_id);
             let srtp = ch.map(|c| c.srtp_enabled).unwrap_or(false);
             let s_ctx = ch.map(|c| Arc::clone(&c.secure_context)).unwrap();
-            (srtp, s_ctx)
+            let ed137 = ch.map(|c| c.ed137_enabled).unwrap_or(false);
+            let ed137_id = ch.map(|c| c.ed137_ptt_id).unwrap_or(0);
+            (srtp, s_ctx, ed137, ed137_id)
         };
 
         let sample_rate = {
@@ -1815,12 +2072,12 @@ fn start_microphone_rtp(
                     devs.find(|d| d.name().ok().map(|n| n == name).unwrap_or(false))
                 })
             }).or_else(|| host.default_input_device());
-            
+
             dev.and_then(|d| d.default_input_config().ok())
                .map(|c| c.sample_rate().0)
                .unwrap_or(44100)
         };
-        
+
         let mut resampler = Resampler::new(sample_rate, 8000);
         let mut tx_highpass = Biquad::highpass(8000.0, 100.0, 0.7071); // cut rumble/DC below 100 Hz
         let mut tx_limiter = AudioLimiter::new(); // AGC + peak limiter for TX path
@@ -1828,7 +2085,16 @@ fn start_microphone_rtp(
         let mut sequence_number: u16 = rand_u32() as u16;
         let mut timestamp: u32 = rand_u32();
         let ssrc: u32 = rand_u32();
-        
+
+        // ACU Z / ED-137 radio (e.g. JPS RSP-Z2) keep-alive: these devices drop
+        // the RTP link if they receive no packet for ~5 s. The PTT path below only
+        // transmits while keyed, so during idle we would send nothing and the link
+        // would time out (talking re-establishes it — the exact symptom reported).
+        // `last_tx_ms` tracks the last packet actually sent to the primary target
+        // (real TX or keep-alive); the idle branch tops it up every ~3 s.
+        const KEEPALIVE_IDLE_MS: u64 = 3000; // send a keep-alive if idle this long (< 5 s ACU limit)
+        let mut last_tx_ms: u64 = now_millis();
+
         println!("[RTP TX Task] Audio pipeline: Mic → Resample → AGC/Limiter → µ-law encode → RTP");
         
         let rtp_socket_tx = Arc::clone(&rtp_socket_clone);
@@ -1872,7 +2138,6 @@ fn start_microphone_rtp(
             // Standard point-to-point PTT logic
             let mut interval = tokio::time::interval(Duration::from_millis(20));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut last_tx_time = tokio::time::Instant::now();
             while let Some(audio_chunk) = rx_audio.recv().await {
                 resampler.process(&audio_chunk, &mut pcm_buffer);
                 
@@ -1889,35 +2154,56 @@ fn start_microphone_rtp(
                     }).sum();
                     let rms = (sum_squares / 160.0).sqrt();
                     let audio_level = (rms * 500.0).clamp(0.0, 100.0) as u32;
-                    
-                    let mut packet = vec![0u8; 12 + 160];
-                    packet[0] = 0x80;
+
+                    let ptt_on = ptt_active_clone.load(Ordering::SeqCst);
+
+                    // ED-137A/B/C RTP header extension: carries PTT/SQU signalling so
+                    // a real radio/VCS on the other end can key/receive properly,
+                    // instead of plain unsignalled RTP. Opt-in per channel.
+                    let ext_bytes: Vec<u8> = if ed137_enabled {
+                        ed137::encode_ed137b(&ed137::Ed137Fields {
+                            ptt_type: if ptt_on { ed137::PttType::Normal } else { ed137::PttType::Off },
+                            ptt_id: ed137_ptt_id,
+                            ..Default::default()
+                        }).to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let ext_len = ext_bytes.len();
+                    let payload_start = 12 + ext_len;
+
+                    let mut packet = vec![0u8; payload_start + 160];
+                    packet[0] = if ext_len > 0 { 0x90 } else { 0x80 }; // version 2, extension bit if ED-137 is on
                     packet[1] = 0x00;
-                    
+
                     packet[2] = (sequence_number >> 8) as u8;
                     packet[3] = (sequence_number & 0xFF) as u8;
-                    
+
                     packet[4] = (timestamp >> 24) as u8;
                     packet[5] = ((timestamp >> 16) & 0xFF) as u8;
                     packet[6] = ((timestamp >> 8) & 0xFF) as u8;
                     packet[7] = (timestamp & 0xFF) as u8;
-                    
+
                     packet[8] = (ssrc >> 24) as u8;
                     packet[9] = ((ssrc >> 16) & 0xFF) as u8;
                     packet[10] = ((ssrc >> 8) & 0xFF) as u8;
                     packet[11] = (ssrc & 0xFF) as u8;
-                    
-                    for i in 0..160 {
-                        packet[12 + i] = linear_to_ulaw(chunk_160[i]);
+
+                    if ext_len > 0 {
+                        packet[12..payload_start].copy_from_slice(&ext_bytes);
                     }
-                    
-                    if ptt_active_clone.load(Ordering::SeqCst) {
+
+                    for i in 0..160 {
+                        packet[payload_start + i] = linear_to_ulaw(chunk_160[i]);
+                    }
+
+                    if ptt_on {
                         if srtp_enabled {
                             let ctx = secure_context.lock().await;
                             if let Some(ref keys) = ctx.keys {
-                                let mut payload = packet[12..].to_vec();
+                                let mut payload = packet[payload_start..].to_vec();
                                 if let Ok(tag) = crypto::encrypt_rtp_gcm(keys, sequence_number, timestamp, ssrc, &mut payload) {
-                                    let mut srtp_packet = packet[0..12].to_vec();
+                                    let mut srtp_packet = packet[0..payload_start].to_vec();
                                     srtp_packet.extend_from_slice(&payload);
                                     srtp_packet.extend_from_slice(&tag);
                                     let _ = rtp_socket_clone.send_to(&srtp_packet, &rtp_dest_clone).await;
@@ -1931,13 +2217,13 @@ fn start_microphone_rtp(
                         // Always send the clean, unencrypted µ-law payload so the
                         // recorder gets plain RTP/PCMU regardless of SRTP.
                         if let Some(ref tap) = rec_tap {
-                            tap.send_ulaw(&packet[12..]).await;
+                            tap.send_ulaw(&packet[payload_start..]).await;
                         }
 
                         // Also mirror to the ACU Bridge leg (e.g. JPS ACU/RSP-Z2), same
                         // half-duplex sharing as the A-MP tap above.
                         if let Some(ref tap) = bridge_tap {
-                            tap.send_ulaw(&packet[12..]).await;
+                            tap.send_ulaw(&packet[payload_start..]).await;
                         }
 
                         // Publish to any Dispatcher patch groups this channel belongs to
@@ -1946,31 +2232,49 @@ fn start_microphone_rtp(
                             if !d.is_member.load(Ordering::Relaxed) {
                                 continue;
                             }
-                            let _ = d.bus.send(DispatchFrame { source_channel_id: channel_id, ulaw: packet[12..].to_vec() });
+                            let _ = d.bus.send(DispatchFrame { source_channel_id: channel_id, ulaw: packet[payload_start..].to_vec() });
                             if let Some(ref tap) = d.mirror_tap {
-                                tap.send_ulaw(&packet[12..]).await;
+                                tap.send_ulaw(&packet[payload_start..]).await;
                             }
                         }
 
-                        last_tx_time = tokio::time::Instant::now();
-                    } else if last_tx_time.elapsed() >= Duration::from_secs(5) {
-                        // Send RTP keepalive (empty payload) to maintain Z2 connection
-                        if srtp_enabled {
-                            let ctx = secure_context.lock().await;
-                            if let Some(ref keys) = ctx.keys {
-                                let mut payload = vec![];
-                                if let Ok(tag) = crypto::encrypt_rtp_gcm(keys, sequence_number, timestamp, ssrc, &mut payload) {
-                                    let mut srtp_packet = packet[0..12].to_vec();
-                                    srtp_packet.extend_from_slice(&tag);
-                                    let _ = rtp_socket_clone.send_to(&srtp_packet, &rtp_dest_clone).await;
-                                }
+                        // Real audio just went out — reset the keep-alive idle timer.
+                        last_tx_ms = now_millis();
+                    } else {
+                        // ── Idle keep-alive to the primary target (ACU Z / RSP-Z2) ──
+                        // PTT is not keyed, so no audio is being transmitted. To stop the
+                        // ACU Z / ED-137 radio from tearing down the link after ~5 s of
+                        // silence, send one PTT-off frame with a µ-law *silence* payload
+                        // every ~3 s. It reuses this stream's seq/ts/ssrc and the same
+                        // ED-137 extension already built above (which encodes PTT=Off when
+                        // idle), so the far end sees one continuous, well-formed RTP flow
+                        // — and, being silence with PTT off, it neither keys the radio nor
+                        // is audible. (A bare payload-less "empty RTP" packet was avoided
+                        // because ED-137 radios commonly ignore it for link-liveness.)
+                        let now = now_millis();
+                        if now.saturating_sub(last_tx_ms) >= KEEPALIVE_IDLE_MS {
+                            // Overwrite the (unsent) mic payload with µ-law silence (0xFF).
+                            for i in 0..160 {
+                                packet[payload_start + i] = 0xFF;
                             }
-                        } else {
-                            let _ = rtp_socket_clone.send_to(&packet[0..12], &rtp_dest_clone).await;
+                            if srtp_enabled {
+                                let ctx = secure_context.lock().await;
+                                if let Some(ref keys) = ctx.keys {
+                                    let mut payload = packet[payload_start..].to_vec();
+                                    if let Ok(tag) = crypto::encrypt_rtp_gcm(keys, sequence_number, timestamp, ssrc, &mut payload) {
+                                        let mut srtp_packet = packet[0..payload_start].to_vec();
+                                        srtp_packet.extend_from_slice(&payload);
+                                        srtp_packet.extend_from_slice(&tag);
+                                        let _ = rtp_socket_clone.send_to(&srtp_packet, &rtp_dest_clone).await;
+                                    }
+                                }
+                            } else {
+                                let _ = rtp_socket_clone.send_to(&packet, &rtp_dest_clone).await;
+                            }
+                            last_tx_ms = now;
                         }
-                        last_tx_time = tokio::time::Instant::now();
                     }
-                    
+
                     sequence_number = sequence_number.wrapping_add(1);
                     timestamp = timestamp.wrapping_add(160);
                     
@@ -2354,6 +2658,9 @@ fn start_audio_playback(
     // Cloned so `dispatch_outs` itself remains available below to spawn the
     // per-group relay tasks after this async block moves its own copy in.
     let dispatch_outs_rx = dispatch_outs.clone();
+    // Cloned so we can update this channel's ED-137 remote PTT/squelch status
+    // (and broadcast it) as extensions arrive, without moving the outer `state`.
+    let state_rx = Arc::clone(&state);
 
     let rx_task = tokio::spawn(async move {
         let mut resampler = PlaybackResampler::new(8000, sample_rate);
@@ -2384,24 +2691,53 @@ fn start_audio_playback(
 
                         let version = (buf[0] >> 6) & 0x03;
                         let payload_type = buf[1] & 0x7F;
-                        
+
                         if version == 2 && payload_type == 0 {
                             let mut raw_payload = None;
-                            
+
+                            // The RTP header + any extension (including an ED-137 PTT/SQU
+                            // block) travels in clear even under SRTP — only the payload
+                            // itself is encrypted — so this is always safe to inspect.
+                            if let Some(fields) = ed137::parse_rtp_ed137(&buf[..len]) {
+                                let squ = fields.squ;
+                                let remote_ptt = fields.ptt_type.is_keyed();
+                                let (changed, tx_ws) = {
+                                    let mut app_state = state_rx.lock().await;
+                                    let mut changed = false;
+                                    if let Some(ch) = app_state.channels.iter_mut().find(|c| c.id == channel_id) {
+                                        if ch.ed137_remote_squelch != squ || ch.ed137_remote_ptt != remote_ptt {
+                                            ch.ed137_remote_squelch = squ;
+                                            ch.ed137_remote_ptt = remote_ptt;
+                                            changed = true;
+                                        }
+                                    }
+                                    (changed, app_state.tx.clone())
+                                };
+                                if changed {
+                                    let msg = serde_json::json!({
+                                        "type": "ed137_status",
+                                        "data": { "id": channel_id, "squelch": squ, "remotePtt": remote_ptt }
+                                    }).to_string();
+                                    let _ = tx_ws.send(msg);
+                                }
+                            }
+
                             if srtp_enabled {
-                                if len >= 12 + 16 {
-                                    let seq = ((buf[2] as u16) << 8) | (buf[3] as u16);
-                                    let ts = ((buf[4] as u32) << 24) | ((buf[5] as u32) << 16) | ((buf[6] as u32) << 8) | (buf[7] as u32);
-                                    let ssrc = ((buf[8] as u32) << 24) | ((buf[9] as u32) << 16) | ((buf[10] as u32) << 8) | (buf[11] as u32);
-                                    
-                                    let mut payload_bytes = buf[12..(len - 16)].to_vec();
-                                    let mut tag_bytes = [0u8; 16];
-                                    tag_bytes.copy_from_slice(&buf[(len - 16)..len]);
-                                    
-                                    let ctx = secure_context.lock().await;
-                                    if let Some(ref keys) = ctx.keys {
-                                        if crypto::decrypt_rtp_gcm(keys, seq, ts, ssrc, &mut payload_bytes, &tag_bytes).is_ok() {
-                                            raw_payload = Some(payload_bytes);
+                                if let Some(header_len) = ed137::rtp_header_len(&buf[..len]) {
+                                    if len >= header_len + 16 {
+                                        let seq = ((buf[2] as u16) << 8) | (buf[3] as u16);
+                                        let ts = ((buf[4] as u32) << 24) | ((buf[5] as u32) << 16) | ((buf[6] as u32) << 8) | (buf[7] as u32);
+                                        let ssrc = ((buf[8] as u32) << 24) | ((buf[9] as u32) << 16) | ((buf[10] as u32) << 8) | (buf[11] as u32);
+
+                                        let mut payload_bytes = buf[header_len..(len - 16)].to_vec();
+                                        let mut tag_bytes = [0u8; 16];
+                                        tag_bytes.copy_from_slice(&buf[(len - 16)..len]);
+
+                                        let ctx = secure_context.lock().await;
+                                        if let Some(ref keys) = ctx.keys {
+                                            if crypto::decrypt_rtp_gcm(keys, seq, ts, ssrc, &mut payload_bytes, &tag_bytes).is_ok() {
+                                                raw_payload = Some(payload_bytes);
+                                            }
                                         }
                                     }
                                 }
@@ -2485,6 +2821,8 @@ fn start_audio_playback(
             primary_rtp_dest.clone(),
             Arc::clone(aq),
             sample_rate,
+            Arc::clone(tap),
+            Arc::clone(&state),
         ))
     } else {
         None
@@ -2776,7 +3114,11 @@ async fn accept_call_handler(
              ch_ref.and_then(|c| c.bridge_local_port).unwrap_or(8004 + (id as u16 - 1) * 2))
         };
         let bridge_tap = build_recording_tap(bridge_en, &bridge_ip, bridge_port, id, Some(bridge_local_port)).await;
-        if bridge_tap.is_some() {
+        if let Some(ref tap) = bridge_tap {
+            // Connected tone as soon as the bridge leg is built, so the far end
+            // (RSP-Z2) gets real audio payload right away instead of the socket
+            // just sitting open with nothing sent.
+            spawn_connected_tone_tap(Arc::clone(tap));
             let upd = {
                 if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
                     ch.bridge_connected = true;
@@ -2803,6 +3145,10 @@ async fn accept_call_handler(
         // Start capture/transmit task
         let dest_rtp = format!("{}:{}", ctx.remote_ip, ctx.remote_rtp_port);
         let dest_rtp_for_bridge = dest_rtp.clone();
+
+        // Connected tone the instant the media path opens.
+        spawn_connected_tone(Arc::clone(&rtp_socket), dest_rtp.clone());
+
         let (stop_flag, rtp_abort) = start_microphone_rtp(
             id, Arc::clone(&rtp_socket), dest_rtp, Arc::clone(&state), selected_device, Arc::clone(&ptt_flag), ctx.call_id.clone(), rec_tap.clone(), bridge_tap.clone(), dispatch_outs.clone()
         );
@@ -2922,7 +3268,7 @@ async fn accept_call_handler(
                                 ch_bye.tx_kbps = 0;
                                 ch_bye.audio_level = 0;
                                 ch_bye.amp_streaming = false;
-                                ch_bye.bridge_connected = false;
+                                ch_bye.bridge_connected = false; ch_bye.bridge_link_alive = false;
                                 ch_bye.dispatch_connected = false;
                             }
                             let _ = tx_cb_listen.send(serde_json::json!({
@@ -2999,7 +3345,7 @@ async fn reject_call_handler(
     if let Some(ctx) = ch.incoming_call.take() {
         ch.status = "IDLE".to_string();
         ch.amp_streaming = false;
-        ch.bridge_connected = false;
+        ch.bridge_connected = false; ch.bridge_link_alive = false;
         ch.dispatch_connected = false;
 
         let ch_clone = ch.clone();
@@ -3166,6 +3512,11 @@ async fn initiate_call_handler(
             }
         };
 
+        // Connected tone the instant the session opens (before the channel even
+        // flips to CONNECTED/"ROUTING"), so the peer gets real RTP/audio payload
+        // right away instead of the link staying silent.
+        spawn_connected_tone(Arc::clone(&rtp_socket), dest_addr.clone());
+
         if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
             ch.target_uri = payload.target_uri.clone();
             ch.codec = payload.codec.clone();
@@ -3245,7 +3596,9 @@ async fn initiate_call_handler(
              ch_ref.and_then(|c| c.bridge_local_port).unwrap_or(8004 + (id as u16 - 1) * 2))
         };
         let bridge_tap = build_recording_tap(bridge_en, &bridge_ip, bridge_port, id, Some(bridge_local_port)).await;
-        if bridge_tap.is_some() {
+        if let Some(ref tap) = bridge_tap {
+            // Connected tone as soon as the bridge leg is built.
+            spawn_connected_tone_tap(Arc::clone(tap));
             let upd = {
                 if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == id) {
                     ch.bridge_connected = true;
@@ -3503,7 +3856,7 @@ async fn initiate_call_handler(
                                 ch_fail.ptt_active = false;
                                 ch_fail.tx_kbps = 0;
                                 ch_fail.amp_streaming = false;
-                                ch_fail.bridge_connected = false;
+                                ch_fail.bridge_connected = false; ch_fail.bridge_link_alive = false;
                                 ch_fail.dispatch_connected = false;
                             }
                             let _ = tx_cb.send(serde_json::json!({
@@ -3616,6 +3969,10 @@ async fn initiate_call_handler(
 
                             let rtp_dest = format!("{}:{}", target_ip_clone, remote_rtp_port);
                             let rtp_sock_task = Arc::clone(&rtp_socket_clone);
+
+                            // Connected tone the instant the media path opens.
+                            spawn_connected_tone(Arc::clone(&rtp_sock_task), rtp_dest.clone());
+
                             let state_audio = Arc::clone(&state_clone);
 
                             // Extract channel metadata before locking again in spawn context
@@ -3673,7 +4030,9 @@ async fn initiate_call_handler(
                                     let _ = lock_rtp.tx.send(upd);
                                 }
                             }
-                            if bridge_tap.is_some() {
+                            if let Some(ref tap) = bridge_tap {
+                                // Connected tone as soon as the bridge leg is built.
+                                spawn_connected_tone_tap(Arc::clone(tap));
                                 let upd = {
                                     if let Some(ch) = lock_rtp.channels.iter_mut().find(|c| c.id == id) {
                                         ch.bridge_connected = true;
@@ -3732,7 +4091,7 @@ async fn initiate_call_handler(
                                 ch_bye.ptt_active = false;
                                 ch_bye.tx_kbps = 0;
                                 ch_bye.amp_streaming = false;
-                                ch_bye.bridge_connected = false;
+                                ch_bye.bridge_connected = false; ch_bye.bridge_link_alive = false;
                                 ch_bye.dispatch_connected = false;
                             }
                             let _ = tx_cb.send(serde_json::json!({
@@ -3851,7 +4210,7 @@ async fn hangup_handler(
         ch.duration = 0;
         ch.ptt_active = false;
         ch.amp_streaming = false;
-        ch.bridge_connected = false;
+        ch.bridge_connected = false; ch.bridge_link_alive = false;
         ch.dispatch_connected = false;
 
         println!("[Rust Engine] [CH {}] Call/Session terminated.", id);
@@ -4096,7 +4455,12 @@ pub fn run() {
             bridge_port: if ch_cfg.bridge_port == 0 { 6004 + (ch_cfg.id as u16 - 1) * 2 } else { ch_cfg.bridge_port },
             bridge_enabled: ch_cfg.bridge_enabled,
             bridge_local_port: ch_cfg.bridge_local_port,
+            ed137_enabled: ch_cfg.ed137_enabled,
+            ed137_ptt_id: ch_cfg.ed137_ptt_id,
+            ed137_remote_squelch: false,
+            ed137_remote_ptt: false,
             bridge_connected: false,
+            bridge_link_alive: false,
             dispatch_connected: false,
             secure_context: Arc::new(tokio::sync::Mutex::new(crypto::SecureChannelContext::new())),
             incoming_call: None,
@@ -4459,7 +4823,7 @@ pub fn run() {
                                                         matched_channel_id = Some(ch.id);
                                                         ch.status = "IDLE".to_string();
                                                         ch.amp_streaming = false;
-                                                        ch.bridge_connected = false;
+                                                        ch.bridge_connected = false; ch.bridge_link_alive = false;
                                                         ch.dispatch_connected = false;
                                                         ch.incoming_call = None;
                                                         break;
@@ -4499,7 +4863,7 @@ pub fn run() {
                                                         ch.tx_kbps = 0;
                                                         ch.audio_level = 0;
                                                         ch.amp_streaming = false;
-                                                        ch.bridge_connected = false;
+                                                        ch.bridge_connected = false; ch.bridge_link_alive = false;
                                                         ch.dispatch_connected = false;
                                                     }
                                                 }
@@ -4754,6 +5118,8 @@ async fn show_config_handler(
 
         let srtp_checked = if ch.srtp_enabled { "checked" } else { "" };
         let sip_auth_checked = if ch.sip_auth_required { "checked" } else { "" };
+        let ed137_checked = if ch.ed137_enabled { "checked" } else { "" };
+        let ed137_ptt_id_val = ch.ed137_ptt_id.to_string();
 
         channels_rows.push_str(&format!(
             r#"
@@ -4776,6 +5142,12 @@ async fn show_config_handler(
                 </td>
                 <td class="col-c">
                     <input type="checkbox" class="chk" name="sip_auth_required_{}" {} {} />
+                </td>
+                <td class="col-c">
+                    <input type="checkbox" class="chk" name="ed137_enabled_{}" {} {} title="Tag outgoing RTP with the ED-137A/B/C PTT/SQU header extension for interop with a real radio/VCS" />
+                </td>
+                <td>
+                    <input type="number" name="ed137_ptt_id_{}" value="{}" {} min="0" max="63" style="width:5em;" />
                 </td>
                 <td>
                     <input type="text" name="sip_user_{}" value="{}" {} placeholder="receiver" />
@@ -4823,6 +5195,12 @@ async fn show_config_handler(
             disabled_attr,
             ch.id,
             sip_auth_checked,
+            disabled_attr,
+            ch.id,
+            ed137_checked,
+            disabled_attr,
+            ch.id,
+            ed137_ptt_id_val,
             disabled_attr,
             ch.id,
             html_escape(&sip_user_val),
@@ -5291,6 +5669,8 @@ async fn show_config_handler(
                               <th>Channel Alias</th>
                               <th class="col-c">SRTP</th>
                               <th class="col-c">SIP Auth</th>
+                              <th class="col-c">ED-137</th>
+                              <th class="col-c">PTT ID</th>
                               <th>Receiver / User</th>
                               <th>Destination IP</th>
                               <th>Dest Port</th>
@@ -6028,6 +6408,12 @@ async fn save_config_handler(
                 ch.sip_auth_required = form_data.contains_key(&format!("sip_auth_required_{}", id));
                 ch.amp_enabled = form_data.contains_key(&format!("amp_channel_enabled_{}", id));
                 ch.bridge_enabled = form_data.contains_key(&format!("bridge_channel_enabled_{}", id));
+                ch.ed137_enabled = form_data.contains_key(&format!("ed137_enabled_{}", id));
+                if let Some(ptt_id_str) = form_data.get(&format!("ed137_ptt_id_{}", id)) {
+                    if let Ok(ptt_id) = ptt_id_str.parse::<u8>() {
+                        ch.ed137_ptt_id = ptt_id.min(63);
+                    }
+                }
 
                 // Recompute computed target_uri for frontend / telemetry
                 ch.target_uri = if ch.protocol == "RTP" {

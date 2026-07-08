@@ -42,6 +42,7 @@ const INITIAL_CHANNELS: ChannelState[] = Array.from({ length: 12 }).map((_, inde
     bridgePort: 6004 + index * 2,
     bridgeEnabled: false,
     bridgeConnected: false,
+    bridgeLinkAlive: false,
     dispatchConnected: false,
   };
 });
@@ -470,6 +471,12 @@ export default function Home() {
               const { id, level } = payload.data;
               setChannels((prev) =>
                 prev.map((ch) => (ch.id === id ? { ...ch, audioLevel: level } : ch))
+              );
+            } else if (payload.type === "bridge_status") {
+              // ACU Bridge keepalive link health (alive within ~6s / stale).
+              const { id, linkAlive } = payload.data;
+              setChannels((prev) =>
+                prev.map((ch) => (ch.id === id ? { ...ch, bridgeLinkAlive: linkAlive } : ch))
               );
             } else if (payload.type === "telemetry") {
               const { cpu, ram } = payload.data;

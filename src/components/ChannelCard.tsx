@@ -35,6 +35,7 @@ export function ChannelCard({
     srtpEnabled = true,
     ampStreaming = false,
     bridgeConnected = false,
+    bridgeLinkAlive = false,
     dispatchConnected = false,
   } = channel;
 
@@ -204,12 +205,28 @@ export function ChannelCard({
             </span>
           </div>
         )}
-        {/* ACU Bridge Indicator (two-way interop leg, distinct from the A-MP mirror above) */}
+        {/* ACU Bridge Indicator (two-way interop leg, distinct from the A-MP mirror above).
+            Color reflects the 5-second keepalive link health: emerald + ping = link ALIVE
+            (RTP from the ACU Z seen within ~6s); amber, static = bridge up but keepalive
+            link STALE / not yet confirmed. */}
         {bridgeConnected && (
-          <div className="absolute left-4 top-0.5 flex items-center justify-center" title="ACU Bridge Active (two-way leg mixed into this call)">
+          <div
+            className="absolute left-4 top-0.5 flex items-center justify-center"
+            title={
+              bridgeLinkAlive
+                ? "ACU Bridge Active — keepalive link ALIVE (RTP from ACU Z within 5s)"
+                : "ACU Bridge Active — keepalive link STALE (no RTP from ACU Z; sending silence keepalives)"
+            }
+          >
             <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-sky-500"></span>
+              {bridgeLinkAlive && (
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              )}
+              <span
+                className={`relative inline-flex rounded-full h-2 w-2 ${
+                  bridgeLinkAlive ? "bg-emerald-500" : "bg-amber-500"
+                }`}
+              ></span>
             </span>
           </div>
         )}
