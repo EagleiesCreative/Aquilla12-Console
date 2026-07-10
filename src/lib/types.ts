@@ -44,6 +44,10 @@ export interface ChannelState {
   ed137Enabled?: boolean;
   /** PTT source id (0-63) this channel identifies itself as in the ED-137 extension word. */
   ed137PttId?: number;
+  /** Per-channel RX audio delay in ms (0 = off): delays received/remote audio before local playback. */
+  rxDelayMs?: number;
+  /** Per-channel TX audio delay in ms (0 = off): delays local mic audio before it is transmitted. */
+  txDelayMs?: number;
   /** Runtime status: true while the most recently received ED-137 extension reported squelch (carrier present) from the radio. */
   ed137RemoteSquelch?: boolean;
   /** Runtime status: true while the most recently received ED-137 extension reported a keyed PTT from the far end. */

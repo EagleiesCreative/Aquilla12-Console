@@ -92,6 +92,15 @@ struct ChannelConfig {
     // VCS/radio expects.
     #[serde(rename = "ed137PttId", default)]
     ed137_ptt_id: u8,
+    // Per-channel audio delay (milliseconds) applied in the live RTP path. 0 = off.
+    // `rx_delay_ms` delays the received/remote audio before it reaches the local
+    // speaker; `tx_delay_ms` delays the local mic audio before it is encoded and
+    // transmitted. Implemented as fixed 8 kHz delay lines pre-filled with silence
+    // (see start_audio_playback / start_microphone_rtp). Bound at call start.
+    #[serde(rename = "rxDelayMs", default)]
+    rx_delay_ms: u16,
+    #[serde(rename = "txDelayMs", default)]
+    tx_delay_ms: u16,
 }
 
 fn default_amp_ip() -> String {
@@ -244,6 +253,10 @@ fn init_db(conn: &Connection) {
     let _ = conn.execute("ALTER TABLE channels ADD COLUMN ed137_enabled INTEGER NOT NULL DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE channels ADD COLUMN ed137_ptt_id INTEGER NOT NULL DEFAULT 0", []);
 
+    // Per-channel RX/TX audio delay in milliseconds — default 0 (no delay).
+    let _ = conn.execute("ALTER TABLE channels ADD COLUMN rx_delay_ms INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE channels ADD COLUMN tx_delay_ms INTEGER NOT NULL DEFAULT 0", []);
+
     // Ensure we have a default/auto-generated API key, SIP auth credentials, and admin login password
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sip_auth_password', 'securepass123')", []).ok();
     
@@ -315,7 +328,7 @@ fn load_config() -> GatewayConfig {
 
     // Load channels (still read is_conference column for backward compat but ignore it)
     let mut stmt = conn.prepare(
-        "SELECT id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port, ed137_enabled, ed137_ptt_id FROM channels ORDER BY id"
+        "SELECT id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port, ed137_enabled, ed137_ptt_id, rx_delay_ms, tx_delay_ms FROM channels ORDER BY id"
     ).unwrap();
 
     let channels: Vec<ChannelConfig> = stmt.query_map([], |row| {
@@ -341,6 +354,8 @@ fn load_config() -> GatewayConfig {
             bridge_local_port: row.get::<_, Option<u32>>(18).unwrap_or(None).map(|v| v as u16),
             ed137_enabled: row.get::<_, i32>(19).unwrap_or(0) != 0,
             ed137_ptt_id: row.get::<_, u32>(20).unwrap_or(0) as u8,
+            rx_delay_ms: row.get::<_, u32>(21).unwrap_or(0) as u16,
+            tx_delay_ms: row.get::<_, u32>(22).unwrap_or(0) as u16,
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -402,8 +417,8 @@ fn save_config(config: &GatewayConfig) {
     conn.execute("BEGIN", []).ok();
     for ch in &config.channels {
         conn.execute(
-            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port, ed137_enabled, ed137_ptt_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port, ed137_enabled, ed137_ptt_id, rx_delay_ms, tx_delay_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             rusqlite::params![
                 ch.id,
                 ch.label,
@@ -425,6 +440,8 @@ fn save_config(config: &GatewayConfig) {
                 ch.bridge_local_port.map(|v| v as u32),
                 ch.ed137_enabled as i32,
                 ch.ed137_ptt_id as u32,
+                ch.rx_delay_ms as u32,
+                ch.tx_delay_ms as u32,
             ],
         ).ok();
     }
@@ -491,8 +508,8 @@ fn save_config_to_conn(conn: &Connection, config: &GatewayConfig) {
 
     for ch in &config.channels {
         conn.execute(
-            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port, ed137_enabled, ed137_ptt_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            "INSERT OR REPLACE INTO channels (id, label, protocol, target_ip, target_port, sip_user, codec, local_port, is_conference, volume, srtp_enabled, sip_auth_required, amp_ip, amp_port, amp_enabled, bridge_ip, bridge_port, bridge_enabled, bridge_local_port, ed137_enabled, ed137_ptt_id, rx_delay_ms, tx_delay_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             rusqlite::params![
                 ch.id, ch.label, ch.protocol, ch.target_ip,
                 ch.target_port as u32, ch.sip_user, ch.codec,
@@ -502,6 +519,7 @@ fn save_config_to_conn(conn: &Connection, config: &GatewayConfig) {
                 ch.bridge_ip, ch.bridge_port as u32, ch.bridge_enabled as i32,
                 ch.bridge_local_port.map(|v| v as u32),
                 ch.ed137_enabled as i32, ch.ed137_ptt_id as u32,
+                ch.rx_delay_ms as u32, ch.tx_delay_ms as u32,
             ],
         ).ok();
     }
@@ -530,6 +548,8 @@ fn default_config() -> GatewayConfig {
             bridge_local_port: None,
             ed137_enabled: false,
             ed137_ptt_id: 0,
+            rx_delay_ms: 0,
+            tx_delay_ms: 0,
         })
         .collect();
 
@@ -599,6 +619,12 @@ struct Channel {
     ed137_enabled: bool,
     #[serde(rename = "ed137PttId")]
     ed137_ptt_id: u8,
+    /// Per-channel RX audio delay in ms (0 = off). Delays received audio into playback.
+    #[serde(rename = "rxDelayMs")]
+    rx_delay_ms: u16,
+    /// Per-channel TX audio delay in ms (0 = off). Delays local mic audio before send.
+    #[serde(rename = "txDelayMs")]
+    tx_delay_ms: u16,
     /// Runtime status: true while the most recent inbound ED-137 extension on
     /// this channel reported squelch (carrier/signal present) from the radio.
     #[serde(rename = "ed137RemoteSquelch")]
@@ -726,6 +752,8 @@ fn save_state_to_file(state: &AppState) {
         bridge_local_port: ch.bridge_local_port,
         ed137_enabled: ch.ed137_enabled,
         ed137_ptt_id: ch.ed137_ptt_id,
+        rx_delay_ms: ch.rx_delay_ms,
+        tx_delay_ms: ch.tx_delay_ms,
     }).collect();
 
     let config = GatewayConfig {
@@ -1458,12 +1486,12 @@ impl RecordingTap {
 // gives the operator on that end an audible "connected" cue.
 // ============================================================================
 
-/// Duration (ms) of the connected tone sent when a leg opens. Also serves as the
-/// ACU Z / RSP-Z2 stream-establishment burst: it must be long enough for the far
-/// end to lock onto the RTP SSRC before the stream drops to the (empty) idle
-/// keep-alive. Bumped from 300 ms → 1000 ms so a full second of continuous audio
-/// establishes the link. Must be a multiple of 20 ms.
-const CONNECTED_TONE_MS: u32 = 1000;
+/// Duration (ms) of the cosmetic connect beep sent to the far end when a leg
+/// opens. This is NOT the link-establishment signal — that job is done by the
+/// keyed PTT-ON burst in the mic TX task (ESTABLISH_BURST_MS), which is what the
+/// ACU Z / RSP-Z2 actually needs. So this tone can be short and unobtrusive.
+/// Must be a multiple of 20 ms.
+const CONNECTED_TONE_MS: u32 = 200;
 
 /// Generate a short tone as 20ms (160-sample) µ-law frames at 8kHz — the same
 /// framing as the live TX audio path. `duration_ms` should be a multiple of
@@ -1494,7 +1522,7 @@ fn generate_connected_tone_frames(freq_hz: f64, duration_ms: u32) -> Vec<[u8; 16
 /// (used for the main leg), paced at 20ms/frame like live audio, with its own
 /// header/seq/ts/ssrc and the marker bit set on the first frame.
 async fn send_connected_tone(socket: &tokio::net::UdpSocket, dest: &str) {
-    let frames = generate_connected_tone_frames(1000.0, CONNECTED_TONE_MS);
+    let frames = generate_connected_tone_frames(400.0, CONNECTED_TONE_MS);
     let mut seq: u16 = rand_u32() as u16;
     let mut ts: u32 = rand_u32();
     // Cosmetic connect beep only — NOT the ACU Z link-establishment signal (that
@@ -1530,7 +1558,7 @@ async fn send_connected_tone(socket: &tokio::net::UdpSocket, dest: &str) {
 /// Same tone, sent through a RecordingTap (ACU Bridge/RSP-Z2 or A-MP leg),
 /// reusing its own shared seq/ts/ssrc space via `send_ulaw`.
 async fn send_connected_tone_via_tap(tap: &RecordingTap) {
-    let frames = generate_connected_tone_frames(1000.0, CONNECTED_TONE_MS);
+    let frames = generate_connected_tone_frames(400.0, CONNECTED_TONE_MS);
     for frame in &frames {
         tap.send_ulaw(frame).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2090,15 +2118,25 @@ fn start_microphone_rtp(
 
     let sender_task = tokio::spawn(async move {
         let state_sender = Arc::clone(&state_clone);
-        let (srtp_enabled, secure_context, ed137_enabled, ed137_ptt_id) = {
+        let (srtp_enabled, secure_context, ed137_enabled, ed137_ptt_id, tx_delay_samples) = {
             let app_state = state_sender.lock().await;
             let ch = app_state.channels.iter().find(|c| c.id == channel_id);
             let srtp = ch.map(|c| c.srtp_enabled).unwrap_or(false);
             let s_ctx = ch.map(|c| Arc::clone(&c.secure_context)).unwrap();
             let ed137 = ch.map(|c| c.ed137_enabled).unwrap_or(false);
             let ed137_id = ch.map(|c| c.ed137_ptt_id).unwrap_or(0);
-            (srtp, s_ctx, ed137, ed137_id)
+            // 8 kHz wire rate → 8 samples per ms. Delay line holds this many samples.
+            let tx_delay = ch.map(|c| c.tx_delay_ms as usize * 8).unwrap_or(0);
+            (srtp, s_ctx, ed137, ed137_id, tx_delay)
         };
+
+        // Fixed TX delay line (8 kHz PCM), pre-filled with silence so the outgoing
+        // mic audio is delayed by exactly `tx_delay_ms` before µ-law encode/send.
+        let mut tx_delay_line: std::collections::VecDeque<i16> =
+            std::collections::VecDeque::from(vec![0i16; tx_delay_samples]);
+        if tx_delay_samples > 0 {
+            println!("[RTP TX Task] Channel {} TX delay: {} samples (8 kHz)", channel_id, tx_delay_samples);
+        }
 
         let sample_rate = {
             let host = cpal::default_host();
@@ -2232,8 +2270,24 @@ fn start_microphone_rtp(
             let mut interval = tokio::time::interval(Duration::from_millis(20));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             while let Some(audio_chunk) = rx_audio.recv().await {
-                resampler.process(&audio_chunk, &mut pcm_buffer);
-                
+                if tx_delay_samples > 0 {
+                    // Resample into a scratch buffer, push it through the fixed
+                    // TX delay line, then feed the (delayed) samples into pcm_buffer.
+                    // Appending N and popping N keeps a constant `tx_delay_samples`
+                    // lag, so the transmitted audio trails the mic by tx_delay_ms.
+                    let mut resampled: Vec<i16> = Vec::new();
+                    resampler.process(&audio_chunk, &mut resampled);
+                    let n = resampled.len();
+                    tx_delay_line.extend(resampled);
+                    for _ in 0..n {
+                        if let Some(s) = tx_delay_line.pop_front() {
+                            pcm_buffer.push(s);
+                        }
+                    }
+                } else {
+                    resampler.process(&audio_chunk, &mut pcm_buffer);
+                }
+
                 while pcm_buffer.len() >= 160 {
                     let mut chunk_160: Vec<i16> = pcm_buffer.drain(..160).collect();
                     for s in chunk_160.iter_mut() {
@@ -2763,7 +2817,21 @@ fn start_audio_playback(
         let mut resampler = PlaybackResampler::new(8000, sample_rate);
         let mut limiter = AudioLimiter::new();
         let mut buf = [0u8; 2048];
-        
+
+        // Per-channel RX audio delay: fixed 8 kHz delay line pre-filled with
+        // silence, applied to the decoded remote audio before it is resampled
+        // into the playback jitter buffer. 8 samples per ms at the 8 kHz wire rate.
+        let rx_delay_samples: usize = {
+            let st = state_rx.lock().await;
+            st.channels.iter().find(|c| c.id == channel_id)
+                .map(|c| c.rx_delay_ms as usize * 8).unwrap_or(0)
+        };
+        let mut rx_delay_line: std::collections::VecDeque<i16> =
+            std::collections::VecDeque::from(vec![0i16; rx_delay_samples]);
+        if rx_delay_samples > 0 {
+            println!("[RTP RX Task] Channel {} RX delay: {} samples (8 kHz)", channel_id, rx_delay_samples);
+        }
+
         println!("[RTP RX Task] Audio pipeline active");
         
         loop {
@@ -2883,10 +2951,20 @@ fn start_audio_playback(
 
                                 // Decode µ-law to linear i16
                                 let mut pcm: Vec<i16> = payload.iter().map(|&b| ulaw_to_linear(b)).collect();
-                                
+
                                 // Apply AGC and limiter to incoming audio
                                 limiter.process(&mut pcm);
-                                
+
+                                // Per-channel RX audio delay: push the decoded frame
+                                // through the fixed 8 kHz delay line (append N, pop N)
+                                // so playback trails the wire by rx_delay_ms.
+                                if rx_delay_samples > 0 {
+                                    rx_delay_line.extend(pcm.iter().copied());
+                                    for s in pcm.iter_mut() {
+                                        *s = rx_delay_line.pop_front().unwrap_or(0);
+                                    }
+                                }
+
                                 // Standard playback path
                                 let mut upsampled = Vec::new();
                                 resampler.process(&pcm, &mut upsampled);
@@ -4554,6 +4632,8 @@ pub fn run() {
             bridge_local_port: ch_cfg.bridge_local_port,
             ed137_enabled: ch_cfg.ed137_enabled,
             ed137_ptt_id: ch_cfg.ed137_ptt_id,
+            rx_delay_ms: ch_cfg.rx_delay_ms,
+            tx_delay_ms: ch_cfg.tx_delay_ms,
             ed137_remote_squelch: false,
             ed137_remote_ptt: false,
             bridge_connected: false,
@@ -5217,6 +5297,8 @@ async fn show_config_handler(
         let sip_auth_checked = if ch.sip_auth_required { "checked" } else { "" };
         let ed137_checked = if ch.ed137_enabled { "checked" } else { "" };
         let ed137_ptt_id_val = ch.ed137_ptt_id.to_string();
+        let rx_delay_val = ch.rx_delay_ms.to_string();
+        let tx_delay_val = ch.tx_delay_ms.to_string();
 
         channels_rows.push_str(&format!(
             r#"
@@ -5245,6 +5327,12 @@ async fn show_config_handler(
                 </td>
                 <td>
                     <input type="number" name="ed137_ptt_id_{}" value="{}" {} min="0" max="63" style="width:5em;" />
+                </td>
+                <td class="col-c">
+                    <input type="number" name="rx_delay_ms_{}" value="{}" {} min="0" max="2000" step="1" style="width:5.5em;" title="Delay received/remote audio before local playback (ms). 0 = off." />
+                </td>
+                <td class="col-c">
+                    <input type="number" name="tx_delay_ms_{}" value="{}" {} min="0" max="2000" step="1" style="width:5.5em;" title="Delay local mic audio before it is transmitted (ms). 0 = off." />
                 </td>
                 <td>
                     <input type="text" name="sip_user_{}" value="{}" {} placeholder="receiver" />
@@ -5298,6 +5386,12 @@ async fn show_config_handler(
             disabled_attr,
             ch.id,
             ed137_ptt_id_val,
+            disabled_attr,
+            ch.id,
+            rx_delay_val,
+            disabled_attr,
+            ch.id,
+            tx_delay_val,
             disabled_attr,
             ch.id,
             html_escape(&sip_user_val),
@@ -5768,6 +5862,8 @@ async fn show_config_handler(
                               <th class="col-c">SIP Auth</th>
                               <th class="col-c">ED-137</th>
                               <th class="col-c">PTT ID</th>
+                              <th class="col-c">RX Delay (ms)</th>
+                              <th class="col-c">TX Delay (ms)</th>
                               <th>Receiver / User</th>
                               <th>Destination IP</th>
                               <th>Dest Port</th>
@@ -6509,6 +6605,18 @@ async fn save_config_handler(
                 if let Some(ptt_id_str) = form_data.get(&format!("ed137_ptt_id_{}", id)) {
                     if let Ok(ptt_id) = ptt_id_str.parse::<u8>() {
                         ch.ed137_ptt_id = ptt_id.min(63);
+                    }
+                }
+                // Per-channel RX/TX audio delay in ms (clamped to 0..=2000). Applied
+                // to the audio path on the next call; bound at call start.
+                if let Some(v) = form_data.get(&format!("rx_delay_ms_{}", id)) {
+                    if let Ok(ms) = v.trim().parse::<u16>() {
+                        ch.rx_delay_ms = ms.min(2000);
+                    }
+                }
+                if let Some(v) = form_data.get(&format!("tx_delay_ms_{}", id)) {
+                    if let Ok(ms) = v.trim().parse::<u16>() {
+                        ch.tx_delay_ms = ms.min(2000);
                     }
                 }
 
