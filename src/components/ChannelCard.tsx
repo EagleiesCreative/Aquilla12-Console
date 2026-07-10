@@ -196,49 +196,55 @@ export function ChannelCard({
     >
       {/* Top Section: Label and Protocol Type */}
       <div className="flex flex-col items-center gap-1 shrink-0 relative w-full">
-        {/* A-MP Recording Mirror Indicator */}
-        {ampStreaming && (
-          <div className="absolute left-0 top-0.5 flex items-center justify-center" title="A-MP Mirror Stream Active (recording to NP-C4I)">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500"></span>
-            </span>
-          </div>
-        )}
-        {/* ACU Bridge Indicator (two-way interop leg, distinct from the A-MP mirror above).
-            Color reflects the 5-second keepalive link health: emerald + ping = link ALIVE
-            (RTP from the ACU Z seen within ~6s); amber, static = bridge up but keepalive
-            link STALE / not yet confirmed. */}
-        {bridgeConnected && (
-          <div
-            className="absolute left-4 top-0.5 flex items-center justify-center"
-            title={
-              bridgeLinkAlive
-                ? "ACU Bridge Active — keepalive link ALIVE (RTP from ACU Z within 5s)"
-                : "ACU Bridge Active — keepalive link STALE (no RTP from ACU Z; sending silence keepalives)"
-            }
-          >
-            <span className="relative flex h-2 w-2">
-              {bridgeLinkAlive && (
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              )}
-              <span
-                className={`relative inline-flex rounded-full h-2 w-2 ${
-                  bridgeLinkAlive ? "bg-emerald-500" : "bg-amber-500"
-                }`}
-              ></span>
-            </span>
-          </div>
-        )}
-        {/* Dispatcher Indicator (patched into an inter-channel group, distinct from ACU Bridge/A-MP above) */}
-        {dispatchConnected && (
-          <div className="absolute left-8 top-0.5 flex items-center justify-center" title="Dispatcher Patch Active (audio bridged with other patched channels)">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
-            </span>
-          </div>
-        )}
+        {/* Status indicators — stacked vertically hugging the top-left CORNER so
+            they sit at the edge (di pinggir pojok) and never crowd the centered
+            channel label. Order top→down: A-MP recording (rose), ACU Bridge
+            (emerald/amber), Dispatcher patch (violet). */}
+        <div className="absolute left-0.5 top-0.5 flex flex-col items-center gap-1 z-10">
+          {/* A-MP Recording Mirror Indicator */}
+          {ampStreaming && (
+            <div className="flex items-center justify-center" title="A-MP Mirror Stream Active (recording to NP-C4I)">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500"></span>
+              </span>
+            </div>
+          )}
+          {/* ACU Bridge Indicator (two-way interop leg, distinct from the A-MP mirror above).
+              Color reflects the 5-second keepalive link health: emerald + ping = link ALIVE
+              (RTP from the ACU Z seen within ~6s); amber, static = bridge up but keepalive
+              link STALE / not yet confirmed. */}
+          {bridgeConnected && (
+            <div
+              className="flex items-center justify-center"
+              title={
+                bridgeLinkAlive
+                  ? "ACU Bridge Active — keepalive link ALIVE (RTP from ACU Z within 5s)"
+                  : "ACU Bridge Active — keepalive link STALE (no RTP from ACU Z; sending silence keepalives)"
+              }
+            >
+              <span className="relative flex h-2 w-2">
+                {bridgeLinkAlive && (
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                )}
+                <span
+                  className={`relative inline-flex rounded-full h-2 w-2 ${
+                    bridgeLinkAlive ? "bg-emerald-500" : "bg-amber-500"
+                  }`}
+                ></span>
+              </span>
+            </div>
+          )}
+          {/* Dispatcher Indicator (patched into an inter-channel group, distinct from ACU Bridge/A-MP above) */}
+          {dispatchConnected && (
+            <div className="flex items-center justify-center" title="Dispatcher Patch Active (audio bridged with other patched channels)">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
+              </span>
+            </div>
+          )}
+        </div>
         {/* Security Indicator */}
         <div className="absolute right-0 top-0" title={srtpEnabled ? "Secure SRTP" : "Plaintext RTP"}>
           {srtpEnabled ? (

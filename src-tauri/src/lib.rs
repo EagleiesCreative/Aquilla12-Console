@@ -1596,15 +1596,44 @@ async fn build_recording_tap(enabled: bool, ip: &str, port: u16, channel_id: u32
     if !enabled || port == 0 || ip.trim().is_empty() {
         return None;
     }
-    let bind_addr = match local_port {
-        Some(p) => format!("0.0.0.0:{}", p),
-        None => "0.0.0.0:0".to_string(),
+    let dest = format!("{}:{}", ip, port);
+
+    // Discover the local source IP the OS would use to REACH this recorder
+    // destination, then bind the mirror socket to that exact IP. This matches how
+    // the SIP/RTP call path resolves `local_ip` (bind + connect(dest)). Over an
+    // L2TP/VPN tunnel this yields the TUNNEL IP rather than the PC's LAN IP, so
+    // the recorder (NP-C4I) sees RTP sourced from the tunnel address it expects —
+    // fixing recording failing when the default 0.0.0.0 bind let the OS pick the
+    // PC IP as the source. Falls back to 0.0.0.0 if the specific bind fails.
+    let src_ip: String = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(probe) => {
+            if probe.connect(&dest).await.is_ok() {
+                probe.local_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "0.0.0.0".to_string())
+            } else {
+                "0.0.0.0".to_string()
+            }
+        }
+        Err(_) => "0.0.0.0".to_string(),
     };
-    match tokio::net::UdpSocket::bind(&bind_addr).await {
+
+    let port_part = local_port.map(|p| p.to_string()).unwrap_or_else(|| "0".to_string());
+    let bind_addr = format!("{}:{}", src_ip, port_part);
+    // Fallback bind if the tunnel/source-IP bind fails (e.g. the IP is not yet
+    // assigned on any local interface) — keeps recording working with OS-chosen source.
+    let fallback_bind = format!("0.0.0.0:{}", port_part);
+
+    let sock_result = match tokio::net::UdpSocket::bind(&bind_addr).await {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            eprintln!("[A-MP/Bridge] Channel {} could not bind mirror socket to {} ({}); falling back to {}", channel_id, bind_addr, e, fallback_bind);
+            tokio::net::UdpSocket::bind(&fallback_bind).await
+        }
+    };
+
+    match sock_result {
         Ok(sock) => {
-            let dest = format!("{}:{}", ip, port);
-            let actual_local_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
-            println!("[A-MP/Bridge] Channel {} mirroring call audio to {} (local port {})", channel_id, dest, actual_local_port);
+            let actual_local = sock.local_addr().map(|a| a.to_string()).unwrap_or_default();
+            println!("[A-MP/Bridge] Channel {} mirroring call audio to {} (bound source {})", channel_id, dest, actual_local);
             Some(Arc::new(RecordingTap {
                 socket: Arc::new(sock),
                 dest,
