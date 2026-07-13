@@ -100,6 +100,15 @@ export default function Home() {
     addLog("Gateway compiled with native Rust engine", "success");
   }, [addLog]);
 
+  // Touchscreen console: a press-and-hold (PTT) is misread by the webview as a
+  // long-press right-click gesture, popping the native context menu mid-transmit.
+  // Suppress it globally so holding a channel card never gets interrupted.
+  useEffect(() => {
+    const suppressContextMenu = (e: MouseEvent) => e.preventDefault();
+    document.addEventListener("contextmenu", suppressContextMenu);
+    return () => document.removeEventListener("contextmenu", suppressContextMenu);
+  }, []);
+
   // Fetch available audio devices and configuration from backend API
   useEffect(() => {
     const fetchDevicesAndConfig = async () => {

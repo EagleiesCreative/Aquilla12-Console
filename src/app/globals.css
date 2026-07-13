@@ -62,6 +62,7 @@ body {
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
+  -webkit-touch-callout: none; /* touchscreen: hold-to-PTT must not trigger the long-press callout/context menu */
 }
 
 /* Sharp inputs/buttons */
