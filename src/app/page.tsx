@@ -665,8 +665,25 @@ export default function Home() {
   const handleClearLogs = () => setLogs([]);
   const isSecure = channels.every(c => c.srtpEnabled);
 
+  // The console is designed at a fixed 800x480 canvas (the native Waveshare
+  // panel). Scale it uniformly to fill any larger display while preserving the
+  // 5:3 aspect ratio, so text/controls grow together instead of looking tiny.
+  // scale = 1 on an actual 800x480 screen.
+  const [uiScale, setUiScale] = useState(1);
+  useEffect(() => {
+    const compute = () =>
+      setUiScale(Math.min(window.innerWidth / 800, window.innerHeight / 480));
+    compute();
+    window.addEventListener("resize", compute);
+    return () => window.removeEventListener("resize", compute);
+  }, []);
+
   return (
-    <div className="w-screen h-screen overflow-hidden flex flex-col bg-zinc-100 text-zinc-900 font-sans select-none relative">
+    <div className="fixed inset-0 bg-black overflow-hidden flex items-center justify-center">
+      <div
+        style={{ width: 800, height: 480, transform: `scale(${uiScale})`, transformOrigin: "center" }}
+        className="overflow-hidden flex flex-col bg-zinc-100 text-zinc-900 font-sans select-none relative"
+      >
       {/* Dashboard Header */}
       <DashboardHeader
         settings={settings}
@@ -821,6 +838,7 @@ export default function Home() {
         </div>
       )}
 
+      </div>
     </div>
   );
 }
