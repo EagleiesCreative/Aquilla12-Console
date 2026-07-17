@@ -86,7 +86,7 @@ export function ChannelCard({
   const isFailed = status === "FAILED";
   const isIdle = status === "IDLE";
 
-  let cardBgClass = "bg-white hover:bg-gray-50/50";
+  let cardBgClass = "bg-white";
   let statusText = "STANDBY";
   let statusColorClass = "text-gray-400";
   let helperText = "TAP TO CALL";
@@ -177,10 +177,14 @@ export function ChannelCard({
   return (
     <div
       onClick={handleCardInteraction}
+      onContextMenu={(e) => e.preventDefault()}
       onTouchStart={(e) => {
         if (isActive) handlePttStart(e);
       }}
       onTouchEnd={() => {
+        if (isActive) handlePttEnd();
+      }}
+      onTouchCancel={() => {
         if (isActive) handlePttEnd();
       }}
       onMouseDown={(e) => {
@@ -192,6 +196,7 @@ export function ChannelCard({
       onMouseLeave={() => {
         if (isActive) handlePttEnd();
       }}
+      style={{ touchAction: "none", WebkitUserSelect: "none", WebkitTouchCallout: "none" }}
       className={`rounded-none flex flex-col justify-between items-center text-center h-full w-full py-4 px-3 font-sans select-none cursor-pointer transition-all duration-150 relative ${cardBgClass}`}
     >
       {/* Top Section: Label and Protocol Type */}

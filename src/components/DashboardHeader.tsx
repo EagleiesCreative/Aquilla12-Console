@@ -79,7 +79,7 @@ export function DashboardHeader({
         {onToggleDispatchMatrix && (
           <button
             onClick={onToggleDispatchMatrix}
-            className="p-1 rounded hover:bg-gray-100 border border-gray-200 text-gray-600 transition cursor-pointer flex items-center justify-center h-5 w-5"
+            className="p-1 rounded border border-gray-200 text-gray-600 transition cursor-pointer flex items-center justify-center h-5 w-5"
             title="Dispatcher Patch Matrix"
           >
             <GitMerge className="h-3 w-3" />
@@ -90,7 +90,7 @@ export function DashboardHeader({
         {showLogsButton && (
           <button
             onClick={onToggleLogs}
-            className="p-1 rounded hover:bg-gray-100 border border-gray-200 text-gray-600 transition cursor-pointer flex items-center justify-center h-5 w-5"
+            className="p-1 rounded border border-gray-200 text-gray-600 transition cursor-pointer flex items-center justify-center h-5 w-5"
             title="Logs Console"
           >
             <Terminal className="h-3 w-3" />
@@ -100,7 +100,7 @@ export function DashboardHeader({
         {/* Settings button */}
         <button
           onClick={onToggleSettings}
-          className="p-1 rounded hover:bg-gray-100 border border-gray-200 text-gray-600 transition cursor-pointer flex items-center justify-center h-5 w-5"
+          className="p-1 rounded border border-gray-200 text-gray-600 transition cursor-pointer flex items-center justify-center h-5 w-5"
           title="Settings"
         >
           <Settings className="h-3 w-3" />

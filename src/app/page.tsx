@@ -7,7 +7,7 @@ import { SystemConsole } from "@/components/SystemConsole";
 import { DispatchMatrixPanel } from "@/components/DispatchMatrixPanel";
 import { CallStatus, ChannelState, CodecType, DispatchGroup, GlobalSettings, LogEntry, LogLevel } from "@/lib/types";
 import { parseSbcAddress } from "@/lib/utils";
-import { Mic, Network, Server, ToggleLeft, ToggleRight, X } from "lucide-react";
+import { Mic, Network, Server, ToggleLeft, ToggleRight, Volume2, X } from "lucide-react";
 
 // Generate initial list of 12 hardware audio channels
 const INITIAL_CHANNELS: ChannelState[] = Array.from({ length: 12 }).map((_, index) => {
@@ -56,6 +56,8 @@ export default function Home() {
     isConnected: false,
     selectedDevice: "",
     availableDevices: [],
+    selectedOutputDevice: "",
+    availableOutputDevices: [],
     ampEnabled: true,
     bridgeEnabled: true,
   });
@@ -100,13 +102,30 @@ export default function Home() {
     addLog("Gateway compiled with native Rust engine", "success");
   }, [addLog]);
 
-  // Touchscreen console: a press-and-hold (PTT) is misread by the webview as a
-  // long-press right-click gesture, popping the native context menu mid-transmit.
-  // Suppress it globally so holding a channel card never gets interrupted.
+  // Touchscreen kiosk hardening. Block anything that drags the panel out of its fixed
+  // 800x480 layout or stalls PTT:
+  //  - the native long-press right-click/context menu (interrupts press-and-hold),
+  //  - pinch / ctrl+wheel / ctrl+/-/0 / WebKit gesture zoom.
   useEffect(() => {
-    const suppressContextMenu = (e: MouseEvent) => e.preventDefault();
-    document.addEventListener("contextmenu", suppressContextMenu);
-    return () => document.removeEventListener("contextmenu", suppressContextMenu);
+    const prevent = (e: Event) => e.preventDefault();
+    document.addEventListener("contextmenu", prevent);
+    const onWheel = (e: WheelEvent) => { if (e.ctrlKey) e.preventDefault(); };
+    document.addEventListener("wheel", onWheel, { passive: false });
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && ["+", "-", "=", "0"].includes(e.key)) e.preventDefault();
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("gesturestart", prevent);
+    document.addEventListener("gesturechange", prevent);
+    document.addEventListener("gestureend", prevent);
+    return () => {
+      document.removeEventListener("contextmenu", prevent);
+      document.removeEventListener("wheel", onWheel);
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("gesturestart", prevent);
+      document.removeEventListener("gesturechange", prevent);
+      document.removeEventListener("gestureend", prevent);
+    };
   }, []);
 
   // Fetch available audio devices and configuration from backend API
@@ -119,6 +138,7 @@ export default function Home() {
         const configRes = await fetch(`${parsed.httpUrl}/api/config`);
         let initialSipPort = "5060";
         let initialDevice = "";
+        let initialOutputDevice = "";
         let initialLocalIp = "";
         let initialAmpEnabled = true;
         let initialBridgeEnabled = true;
@@ -126,6 +146,7 @@ export default function Home() {
           const cfg = await configRes.json();
           initialSipPort = cfg.sipPort || "5060";
           initialDevice = cfg.selectedDevice || "";
+          initialOutputDevice = cfg.selectedOutputDevice || "";
           initialLocalIp = cfg.localIp || "";
           if (cfg.ampEnabled !== undefined) initialAmpEnabled = cfg.ampEnabled;
           if (cfg.bridgeEnabled !== undefined) initialBridgeEnabled = cfg.bridgeEnabled;
@@ -165,12 +186,26 @@ export default function Home() {
             };
           });
         }
+
+        // Output (playback) interfaces. Empty selection => system default (SBC).
+        const outRes = await fetch(`${parsed.httpUrl}/api/audio-output-devices`);
+        if (outRes.ok) {
+          const outList = await outRes.json();
+          setSettings((prev) => ({
+            ...prev,
+            availableOutputDevices: outList,
+            selectedOutputDevice: initialOutputDevice || prev.selectedOutputDevice || "",
+          }));
+        }
       } catch (err) {
         const mockList = ["System Default Microphone", "Multi-Channel I2S HAT Capture", "USB Audio Interface"];
+        const mockOutList = ["System Default (SBC onboard)", "MAX98357A I2S DAC", "USB Audio Output"];
         setSettings((prev) => ({
           ...prev,
           availableDevices: mockList,
           selectedDevice: prev.selectedDevice || mockList[0],
+          availableOutputDevices: mockOutList,
+          selectedOutputDevice: prev.selectedOutputDevice || "",
         }));
       }
     };
@@ -207,6 +242,19 @@ export default function Home() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ device: newSettings.selectedDevice }),
           }).catch((err) => console.error("Failed to sync audio device with backend", err));
+        }
+      }
+
+      if (newSettings.selectedOutputDevice !== undefined) {
+        const label = newSettings.selectedOutputDevice || "System Default (SBC)";
+        addLog(`Audio output set to: ${label}`, "success");
+        const parsed = parseSbcAddress(updated.sbcIp || "localhost");
+        if (parsed) {
+          fetch(`${parsed.httpUrl}/api/audio-output-devices/select`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ device: newSettings.selectedOutputDevice || "none" }),
+          }).catch((err) => console.error("Failed to sync audio output device with backend", err));
         }
       }
 
@@ -467,6 +515,10 @@ export default function Home() {
                 ...prev,
                 sipPort: cfg.sipPort || prev.sipPort,
                 selectedDevice: cfg.selectedDevice || prev.selectedDevice,
+                selectedOutputDevice:
+                  cfg.selectedOutputDevice !== undefined
+                    ? cfg.selectedOutputDevice
+                    : prev.selectedOutputDevice,
                 localIp: cfg.localIp || prev.localIp,
                 ampEnabled: cfg.ampEnabled !== undefined ? cfg.ampEnabled : prev.ampEnabled,
                 bridgeEnabled: cfg.bridgeEnabled !== undefined ? cfg.bridgeEnabled : prev.bridgeEnabled,
@@ -653,7 +705,7 @@ export default function Home() {
               </h2>
               <button 
                 onClick={() => setShowSettings(false)}
-                className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-700 transition cursor-pointer"
+                className="p-1 rounded text-gray-400 transition cursor-pointer"
               >
                 <X className="h-4 w-4" />
               </button>
@@ -709,12 +761,29 @@ export default function Home() {
                 </select>
               </div>
 
+              {/* Audio Output */}
+              <div className="flex flex-col gap-1">
+                <label className="text-[10px] uppercase font-bold text-gray-500 flex items-center gap-1">
+                  <Volume2 className="h-3 w-3" /> Audio Output Interface
+                </label>
+                <select
+                  value={settings.selectedOutputDevice}
+                  onChange={(e) => handleSettingsChange({ selectedOutputDevice: e.target.value })}
+                  className="bg-gray-50 border border-gray-200 px-2 py-1 text-xs font-sans text-gray-900 rounded focus:outline-none focus:border-gray-400 cursor-pointer"
+                >
+                  <option value="">System Default (SBC onboard)</option>
+                  {settings.availableOutputDevices.map((dev) => (
+                    <option key={dev} value={dev}>{dev}</option>
+                  ))}
+                </select>
+              </div>
+
               {/* Simulation Switch */}
               <div className="flex items-center justify-between border-t border-gray-100 pt-3 mt-1">
                 <span className="text-[11px] font-bold text-gray-700 uppercase">Simulator Mode</span>
                 <button
                   onClick={() => handleSettingsChange({ isSimulatorMode: !settings.isSimulatorMode })}
-                  className="flex items-center gap-1 transition cursor-pointer text-gray-600 hover:text-gray-950"
+                  className="flex items-center gap-1 transition cursor-pointer text-gray-600"
                 >
                   {settings.isSimulatorMode ? (
                     <ToggleRight className="h-6 w-6 text-amber-500" />

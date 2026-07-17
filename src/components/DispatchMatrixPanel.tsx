@@ -58,7 +58,7 @@ export function DispatchMatrixPanel({
         </h2>
         <button
           onClick={onClose}
-          className="p-0.5 hover:bg-gray-100 text-gray-400 hover:text-gray-700 transition cursor-pointer"
+          className="p-0.5 text-gray-400 transition cursor-pointer"
         >
           <X className="h-3.5 w-3.5" />
         </button>
@@ -100,7 +100,7 @@ export function DispatchMatrixPanel({
                           className={`block w-full h-6 min-w-[26px] border transition cursor-pointer ${
                             isMember
                               ? "bg-emerald-500 border-emerald-600"
-                              : "bg-gray-100 border-gray-200 hover:border-blue-400 active:bg-gray-200"
+                              : "bg-gray-100 border-gray-200 active:bg-gray-200"
                           }`}
                         />
                       </td>

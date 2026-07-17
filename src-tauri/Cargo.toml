@@ -48,3 +48,4 @@ hyper-util = { version = "0.1", features = ["full"] }
 rustls-pemfile = "2"
 tower = "0.5.3"
 tower-service = "0.3"
+hidapi = "2"

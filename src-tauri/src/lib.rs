@@ -18,6 +18,7 @@ use rusqlite::Connection;
 
 mod crypto;
 mod ed137;
+mod hid_panel;
 
 use std::sync::OnceLock;
 use std::sync::Mutex as StdMutex;
@@ -165,6 +166,10 @@ struct GatewayConfig {
     sip_port: u16,
     #[serde(rename = "selectedDevice")]
     selected_device: Option<String>,
+    // Playback (output) interface. None/empty => system default (SBC onboard).
+    // A device name (e.g. an I2S DAC / MAX98357A) routes playback there instead.
+    #[serde(rename = "selectedOutputDevice", default)]
+    selected_output_device: Option<String>,
     channels: Vec<ChannelConfig>,
     // A-MP global master enable
     #[serde(rename = "ampEnabled", default = "default_true")]
@@ -303,6 +308,13 @@ fn load_config() -> GatewayConfig {
         })
         .unwrap_or(None);
 
+    let selected_output_device: Option<String> = conn
+        .query_row("SELECT value FROM settings WHERE key = 'selected_output_device'", [], |row| {
+            let v: String = row.get(0)?;
+            Ok(if v.is_empty() { None } else { Some(v) })
+        })
+        .unwrap_or(None);
+
     let amp_enabled: bool = conn
         .query_row("SELECT value FROM settings WHERE key = 'amp_enabled'", [], |row| {
             let v: String = row.get(0)?;
@@ -369,6 +381,7 @@ fn load_config() -> GatewayConfig {
     GatewayConfig {
         sip_port,
         selected_device,
+        selected_output_device,
         channels,
         amp_enabled,
         bridge_enabled,
@@ -396,6 +409,11 @@ fn save_config(config: &GatewayConfig) {
     conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_device', ?1)",
         [config.selected_device.clone().unwrap_or_default()],
+    ).ok();
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_output_device', ?1)",
+        [config.selected_output_device.clone().unwrap_or_default()],
     ).ok();
 
     conn.execute(
@@ -492,6 +510,11 @@ fn save_config_to_conn(conn: &Connection, config: &GatewayConfig) {
     ).ok();
 
     conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_output_device', ?1)",
+        [config.selected_output_device.clone().unwrap_or_default()],
+    ).ok();
+
+    conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES ('amp_enabled', ?1)",
         [if config.amp_enabled { "true" } else { "false" }],
     ).ok();
@@ -556,6 +579,7 @@ fn default_config() -> GatewayConfig {
     GatewayConfig {
         sip_port: 5060,
         selected_device: None,
+        selected_output_device: None,
         channels,
         amp_enabled: true,
         bridge_enabled: true,
@@ -705,6 +729,8 @@ struct AppState {
     tx: broadcast::Sender<String>,
     active_calls: Vec<ActiveCall>,
     selected_device: Option<String>,
+    /// Playback interface name. None/empty => OS default output (SBC onboard).
+    selected_output_device: Option<String>,
     sip_port: u16,
     amp_enabled: bool,
     bridge_enabled: bool,
@@ -759,6 +785,7 @@ fn save_state_to_file(state: &AppState) {
     let config = GatewayConfig {
         sip_port: state.sip_port,
         selected_device: state.selected_device.clone(),
+        selected_output_device: state.selected_output_device.clone(),
         channels: channel_configs,
         amp_enabled: state.amp_enabled,
         bridge_enabled: state.bridge_enabled,
@@ -2650,15 +2677,52 @@ fn start_audio_playback(
     bridge_tap: Option<Arc<RecordingTap>>,
     primary_rtp_dest: String,
     dispatch_outs: Vec<DispatchOut>,
+    output_device_name: Option<String>,
 ) -> PlaybackHandles {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::Ordering;
 
-    // Query output device and sample rate ONCE on the calling thread to prevent mismatches
+    // Query output device and sample rate ONCE on the calling thread to prevent mismatches.
+    // Selection priority:
+    //   1. AQUILLA_OUTPUT_DEVICE env var (exact/substring override for deployments/tests),
+    //   2. the user-selected output interface from the console (`output_device_name`),
+    //   3. the OS default output device (SBC onboard) when nothing is selected.
+    // Nothing is hardcoded to the I2S DAC — the operator picks it explicitly if wanted.
     let host = cpal::default_host();
-    let device = host.default_output_device();
-    
+    let device = {
+        let env_want = std::env::var("AQUILLA_OUTPUT_DEVICE")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let sel_want = output_device_name
+            .clone()
+            .filter(|s| !s.is_empty());
+
+        let by_name = |want: &str| {
+            let want_l = want.to_lowercase();
+            host.output_devices().ok().and_then(|mut devs| {
+                // Prefer an exact name match, fall back to a substring match so a
+                // short label (e.g. "max98357a") still resolves to the full ALSA name.
+                devs.find(|d| d.name().map(|n| n == want).unwrap_or(false))
+                    .or_else(|| {
+                        host.output_devices().ok().and_then(|mut d2| {
+                            d2.find(|d| d.name().map(|n| n.to_lowercase().contains(&want_l)).unwrap_or(false))
+                        })
+                    })
+            })
+        };
+
+        env_want
+            .as_deref()
+            .and_then(|s| by_name(s))
+            .or_else(|| sel_want.as_deref().and_then(|s| by_name(s)))
+            .or_else(|| host.default_output_device())
+    };
+    match device.as_ref().and_then(|d| d.name().ok()) {
+        Some(name) => println!("[RTP Playback] Output interface: {}", name),
+        None => println!("[RTP Playback] Output interface: <none / system default>"),
+    }
+
     let (config, sample_rate) = if let Some(ref d) = device {
         if let Ok(c) = d.default_output_config() {
             let sr = c.sample_rate().0;
@@ -3283,7 +3347,8 @@ async fn accept_call_handler(
         };
 
         let selected_device = lock.selected_device.clone();
-        
+        let selected_output_device = lock.selected_output_device.clone();
+
         // Extract channel metadata before releasing the lock reference (avoid re-locking in sync fn)
         let ch_srtp = lock.channels.iter().find(|c| c.id == id).map(|c| c.srtp_enabled).unwrap_or(false);
         let ch_ctx = lock.channels.iter().find(|c| c.id == id).map(|c| Arc::clone(&c.secure_context)).unwrap();
@@ -3359,7 +3424,7 @@ async fn accept_call_handler(
 
         // Start playback task
         let stop_flag_playback = Arc::clone(&stop_flag);
-        let playback_handles = start_audio_playback(id, Arc::clone(&rtp_socket), Arc::clone(&state), stop_flag_playback, ch_srtp, ch_ctx, ctx.call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_flag), bridge_tap.clone(), dest_rtp_for_bridge, dispatch_outs);
+        let playback_handles = start_audio_playback(id, Arc::clone(&rtp_socket), Arc::clone(&state), stop_flag_playback, ch_srtp, ch_ctx, ctx.call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_flag), bridge_tap.clone(), dest_rtp_for_bridge, dispatch_outs, selected_output_device.clone());
         let rtp_rx_abort = playback_handles.rx_abort;
         let bridge_abort = playback_handles.bridge_abort;
         let dispatch_aborts = playback_handles.dispatch_aborts;
@@ -3764,6 +3829,7 @@ async fn initiate_call_handler(
         let rtp_sock_task = Arc::clone(&rtp_socket);
         let state_audio = Arc::clone(&state);
         let selected_device = lock.selected_device.clone();
+        let selected_output_device = lock.selected_output_device.clone();
 
         // Extract channel metadata before releasing the lock reference
         let ch_srtp = lock.channels.iter().find(|c| c.id == id).map(|c| c.srtp_enabled).unwrap_or(false);
@@ -3831,7 +3897,7 @@ async fn initiate_call_handler(
 
         let audio_flag_playback = Arc::clone(&audio_flag);
         let playback_handles = start_audio_playback(
-            id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_active_flag_clone), bridge_tap.clone(), rtp_dest_for_bridge, dispatch_outs
+            id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_active_flag_clone), bridge_tap.clone(), rtp_dest_for_bridge, dispatch_outs, selected_output_device.clone()
         );
         let rtp_rx_task = playback_handles.rx_abort;
         let bridge_abort = playback_handles.bridge_abort;
@@ -3991,7 +4057,8 @@ async fn initiate_call_handler(
         let call_id_clone = call_id.clone();
         let dest_addr_clone = dest_addr.clone();
         let selected_device = lock.selected_device.clone();
-        
+        let selected_output_device = lock.selected_output_device.clone();
+
         let sip_listen_task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             let mut remote_to_tag = None;
@@ -4208,7 +4275,7 @@ async fn initiate_call_handler(
 
                              let audio_flag_playback = Arc::clone(&audio_flag);
                              let playback_handles = start_audio_playback(
-                                 id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_active_flag_clone), bridge_tap.clone(), rtp_dest_for_bridge, dispatch_outs
+                                 id, Arc::clone(&rtp_sock_task), Arc::clone(&state_audio), audio_flag_playback, ch_srtp, ch_ctx, call_id.clone(), rec_tap.clone(), Arc::clone(&ptt_active_flag_clone), bridge_tap.clone(), rtp_dest_for_bridge, dispatch_outs, selected_output_device.clone()
                              );
                              let rtp_rx_task = playback_handles.rx_abort;
                              let bridge_abort = playback_handles.bridge_abort;
@@ -4607,6 +4674,257 @@ async fn get_audio_devices_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(devices))
 }
 
+fn get_output_devices() -> Vec<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let mut devices = Vec::new();
+    if let Ok(output_devices) = host.output_devices() {
+        for device in output_devices {
+            if let Ok(name) = device.name() {
+                if !devices.contains(&name) {
+                    devices.push(name);
+                }
+            }
+        }
+    }
+    if devices.is_empty() {
+        devices.push("Default System Audio Output".to_string());
+    }
+    devices
+}
+
+async fn get_audio_output_devices_handler() -> impl IntoResponse {
+    let devices = get_output_devices();
+    (StatusCode::OK, Json(devices))
+}
+
+// REST: Bind selected audio output (playback) device
+async fn select_audio_output_device_handler(
+    State(state): State<Arc<Mutex<AppState>>>,
+    Json(payload): Json<SelectAudioDeviceRequest>,
+) -> impl IntoResponse {
+    let mut lock = state.lock().await;
+    let dev = payload.device.clone();
+    lock.selected_output_device = if dev == "none" || dev.is_empty() { None } else { Some(dev) };
+    println!(
+        "[Rust Engine] Playback interface bound to: {}",
+        lock.selected_output_device.clone().unwrap_or_else(|| "<system default>".to_string())
+    );
+    save_state_to_file(&lock);
+
+    let config_msg = serde_json::json!({
+        "type": "config_update",
+        "data": {
+            "sipPort": lock.sip_port.to_string(),
+            "selectedOutputDevice": lock.selected_output_device.clone().unwrap_or_default()
+        }
+    }).to_string();
+    let _ = lock.tx.send(config_msg);
+
+    (StatusCode::OK, Json(serde_json::json!({ "success": true })))
+}
+
+// ---------------------------------------------------------------------------
+// Aquilla 12 HID control surface — engine wiring
+// ---------------------------------------------------------------------------
+
+/// Sidecar config for the HID panel's button/encoder -> channel mapping,
+/// following the same standalone-JSON-file convention as `gateway_config.json`
+/// (loaded once at startup; not part of the SQLite-backed live config since
+/// the wiring is a hardware fact of the panel, not something the /config web
+/// UI edits). Missing/unmapped fields fall back to `HidPanelConfig::default()`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum HidProductId {
+    Number(u16),
+    /// Hex string ("0xA612") or plain decimal string.
+    Text(String),
+}
+
+impl HidProductId {
+    fn resolve(&self) -> Option<u16> {
+        match self {
+            HidProductId::Number(n) => Some(*n),
+            HidProductId::Text(s) => match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                Some(hex) => u16::from_str_radix(hex, 16).ok(),
+                None => s.parse::<u16>().ok(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HidPanelConfigFile {
+    #[serde(rename = "productId")]
+    product_id: Option<HidProductId>,
+    /// SW0..SW3 -> channel id, `null` for an unmapped button.
+    #[serde(rename = "pttChannelMap", default)]
+    ptt_channel_map: Vec<Option<u32>>,
+    #[serde(rename = "gainStepDb")]
+    gain_step_db: Option<f32>,
+}
+
+fn load_hid_panel_config() -> hid_panel::HidPanelConfig {
+    let mut config = hid_panel::HidPanelConfig::default();
+
+    let paths_to_try = [
+        std::path::PathBuf::from("../hid_panel_config.json"),
+        std::path::PathBuf::from("hid_panel_config.json"),
+    ];
+
+    for path in paths_to_try {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            match serde_json::from_str::<HidPanelConfigFile>(&content) {
+                Ok(file) => {
+                    if let Some(pid) = file.product_id.as_ref().and_then(HidProductId::resolve) {
+                        config.product_id = pid;
+                    }
+                    if let Some(step) = file.gain_step_db {
+                        config.gain_step_db = step;
+                    }
+                    for (i, slot) in config.ptt_channel_map.iter_mut().enumerate() {
+                        if let Some(Some(channel)) = file.ptt_channel_map.get(i) {
+                            *slot = Some(*channel);
+                        }
+                    }
+                    println!("[HID Panel] Loaded config from: {}", path.display());
+                }
+                Err(e) => eprintln!("[HID Panel] Failed to parse {}: {e}", path.display()),
+            }
+            break;
+        }
+    }
+
+    if config.ptt_channel_map.iter().all(|c| c.is_none()) {
+        println!("[HID Panel] No PTT buttons mapped (see hid_panel_config.json) — dedicated PTT buttons will be inert until configured.");
+    }
+
+    config
+}
+
+/// Drives the live engine directly from the HID thread — no IPC, no webview.
+/// Wraps the same `AppState` mutex the rest of the engine uses; called via
+/// `blocking_lock()` since this is invoked from a plain OS thread, not an
+/// async task (see `tokio::sync::Mutex::blocking_lock` — this is exactly the
+/// use case it exists for).
+///
+/// Gain is stored back into the existing `Channel::volume` field (0-100%,
+/// 100% = unity/0dB) rather than a new column, so there is no boost headroom
+/// above 0dB — only attenuation down to `gain_min_db`. That is an honest
+/// reflection of what the existing field can represent, not a new limit.
+struct HidEngineAdapter {
+    state: Arc<Mutex<AppState>>,
+    gain_min_db: f32,
+    gain_max_db: f32,
+}
+
+impl hid_panel::EngineControl for HidEngineAdapter {
+    fn set_ptt(&self, channel: u32, active: bool) {
+        let mut lock = self.state.blocking_lock();
+
+        // Flip the live TX-gate atomic first, ahead of any bookkeeping or
+        // broadcast, to minimize time-to-effect on the safety-critical path.
+        if let Some(call) = lock.active_calls.iter_mut().find(|c| c.channel_id == channel) {
+            if let Some(ref ptt_flag) = call.ptt_active {
+                ptt_flag.store(active, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let tx = lock.tx.clone();
+        if let Some(ch) = lock.channels.iter_mut().find(|c| c.id == channel) {
+            ch.ptt_active = active;
+            ch.tx_kbps = if active { 80 } else { 0 };
+
+            let _ = tx.send(serde_json::json!({
+                "type": "channel_update",
+                "data": { "id": channel, "pttActive": ch.ptt_active, "txKbps": ch.tx_kbps }
+            }).to_string());
+
+            let _ = tx.send(serde_json::json!({
+                "type": "log",
+                "data": {
+                    "level": "info",
+                    "channelId": channel,
+                    "message": format!("[HID Panel] Channel {} PTT {}", channel, if active { "pressed (Transmitting)" } else { "released (Muted)" })
+                }
+            }).to_string());
+        }
+    }
+
+    fn adjust_gain(&self, channel: u32, delta_db: f32) -> f32 {
+        let mut lock = self.state.blocking_lock();
+        let tx = lock.tx.clone();
+
+        let Some(ch) = lock.channels.iter_mut().find(|c| c.id == channel) else {
+            return 0.0;
+        };
+
+        let current_db = if ch.volume == 0 {
+            self.gain_min_db
+        } else {
+            20.0 * (ch.volume as f32 / 100.0).log10()
+        };
+        let target_db = (current_db + delta_db).clamp(self.gain_min_db, self.gain_max_db);
+        let percent = (100.0 * 10f32.powf(target_db / 20.0)).round().clamp(0.0, 100.0);
+        ch.volume = percent as u32;
+        let actual_db = if ch.volume == 0 {
+            self.gain_min_db
+        } else {
+            20.0 * (ch.volume as f32 / 100.0).log10()
+        };
+
+        let _ = tx.send(serde_json::json!({
+            "type": "channel_update",
+            "data": { "id": channel, "volume": ch.volume }
+        }).to_string());
+
+        actual_db
+    }
+}
+
+/// Forwards HID panel notifications to the console over the same WebSocket
+/// broadcast every other engine event uses — this is a notification only,
+/// the control decision already happened in `HidEngineAdapter`.
+struct HidBroadcastSink {
+    tx: broadcast::Sender<String>,
+}
+
+impl hid_panel::PanelEventSink for HidBroadcastSink {
+    fn emit(&self, event: hid_panel::PanelEvent) {
+        use hid_panel::PanelEvent;
+        let msg = match event {
+            PanelEvent::Connected => serde_json::json!({
+                "type": "log",
+                "data": { "level": "success", "message": "[HID Panel] Aquilla 12 control surface connected." }
+            }),
+            PanelEvent::Disconnected => serde_json::json!({
+                "type": "log",
+                "data": { "level": "warn", "message": "[HID Panel] Aquilla 12 control surface disconnected — all HID-held PTT released." }
+            }),
+            PanelEvent::Ptt { channel, active } => serde_json::json!({
+                "type": "channel_update",
+                "data": { "id": channel, "pttActive": active }
+            }),
+            PanelEvent::EncoderSwitch { index, pressed } => serde_json::json!({
+                "type": "log",
+                "data": {
+                    "level": "info",
+                    "message": format!("[HID Panel] Encoder switch E{} {}", index, if pressed { "pressed" } else { "released" })
+                }
+            }),
+            PanelEvent::GainChanged { channel, gain_db } => serde_json::json!({
+                "type": "log",
+                "data": {
+                    "level": "info",
+                    "channelId": channel,
+                    "message": format!("[HID Panel] Channel {} gain {:.1} dB", channel, gain_db)
+                }
+            }),
+        };
+        let _ = self.tx.send(msg.to_string());
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Install the rustls ring crypto provider at process startup.
@@ -4678,6 +4996,7 @@ pub fn run() {
         tx: tx.clone(),
         active_calls: Vec::new(),
         selected_device: config.selected_device,
+        selected_output_device: config.selected_output_device,
         sip_port: config.sip_port,
         amp_enabled: config.amp_enabled,
         bridge_enabled: config.bridge_enabled,
@@ -4688,6 +5007,7 @@ pub fn run() {
         dispatch_membership_flags: HashMap::new(),
     }));
     let state_for_server = Arc::clone(&state);
+    let tx_for_hid = tx.clone();
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -4697,6 +5017,23 @@ pub fn run() {
                         .level(log::LevelFilter::Info)
                         .build(),
                 )?;
+            }
+
+            // Spawn the Aquilla 12 HID control surface thread. PTT calls
+            // (HidEngineAdapter::set_ptt) run synchronously in-process from
+            // this dedicated OS thread — never through Tauri IPC/webview.
+            // The webview only gets notified afterwards via HidBroadcastSink,
+            // for indicator UI.
+            {
+                let hid_config = load_hid_panel_config();
+                let engine = Arc::new(HidEngineAdapter {
+                    state: Arc::clone(&state_for_server),
+                    gain_min_db: hid_config.gain_min_db,
+                    gain_max_db: hid_config.gain_max_db,
+                });
+                let sink = Arc::new(HidBroadcastSink { tx: tx_for_hid.clone() });
+                let hid_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                hid_panel::spawn(engine, sink, hid_config, hid_shutdown);
             }
 
             // Spawn Global SIP Listener for incoming calls (Option B)
@@ -5226,6 +5563,8 @@ pub fn run() {
                     .route("/api/dispatch/toggle", post(dispatch_toggle_handler))
                     .route("/api/audio-devices", get(get_audio_devices_handler))
                     .route("/api/audio-devices/select", post(select_audio_device_handler))
+                    .route("/api/audio-output-devices", get(get_audio_output_devices_handler))
+                    .route("/api/audio-output-devices/select", post(select_audio_output_device_handler))
                     .route("/api/config", get(get_config_handler))
                     // Web Config routes
                     .route("/config", get(show_config_handler))
@@ -5279,6 +5618,27 @@ async fn show_config_handler(
     for dev in &devices {
         let selected = if dev == &current_device { "selected" } else { "" };
         devices_options.push_str(&format!(
+            "<option value=\"{}\" {}>{}</option>",
+            html_escape(dev),
+            selected,
+            html_escape(dev)
+        ));
+    }
+
+    // Output (playback) interface options — empty value => system default (SBC).
+    let output_devices = get_output_devices();
+    let mut output_devices_options = String::new();
+    let current_output_device = lock.selected_output_device.clone().unwrap_or_default();
+
+    output_devices_options.push_str("<option value=\"\" ");
+    if current_output_device.is_empty() {
+        output_devices_options.push_str("selected");
+    }
+    output_devices_options.push_str(">System Default (SBC onboard)</option>");
+
+    for dev in &output_devices {
+        let selected = if dev == &current_output_device { "selected" } else { "" };
+        output_devices_options.push_str(&format!(
             "<option value=\"{}\" {}>{}</option>",
             html_escape(dev),
             selected,
@@ -5858,7 +6218,7 @@ async fn show_config_handler(
                     <div class="card">
                       <div class="card-head">
                         <div class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
-                        <div><div class="card-title">System Interface</div><div class="card-desc">Primary signalling port and audio capture device</div></div>
+                        <div><div class="card-title">System Interface</div><div class="card-desc">Primary signalling port and audio capture / playback devices</div></div>
                       </div>
                       <div class="card-body">
                         <div class="grid2">
@@ -5869,6 +6229,10 @@ async fn show_config_handler(
                           <div class="field">
                             <label for="selected_device">Active Audio Input Interface</label>
                             <select id="selected_device" name="selected_device">{}</select>
+                          </div>
+                          <div class="field">
+                            <label for="selected_output_device">Active Audio Output Interface</label>
+                            <select id="selected_output_device" name="selected_output_device">{}</select>
                           </div>
                         </div>
                       </div>
@@ -6297,6 +6661,7 @@ async fn show_config_handler(
         message_banner,
         lock.sip_port,
         devices_options,
+        output_devices_options,
         channels_rows,
         amp_enabled_checked,
         amp_rows,
@@ -6576,6 +6941,13 @@ async fn save_config_handler(
             lock.selected_device = Some(device.clone());
         }
     }
+    if let Some(device) = form_data.get("selected_output_device") {
+        if device == "none" || device.is_empty() {
+            lock.selected_output_device = None;
+        } else {
+            lock.selected_output_device = Some(device.clone());
+        }
+    }
 
     // global mirror enabled
     lock.amp_enabled = amp_enabled;
@@ -6711,6 +7083,7 @@ async fn save_config_handler(
         "data": {
             "sipPort": lock.sip_port.to_string(),
             "selectedDevice": lock.selected_device.clone().unwrap_or_default(),
+            "selectedOutputDevice": lock.selected_output_device.clone().unwrap_or_default(),
             "localIp": get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
             "ampEnabled": lock.amp_enabled,
             "bridgeEnabled": lock.bridge_enabled
@@ -6774,6 +7147,7 @@ async fn get_config_handler(
         Json(serde_json::json!({
             "sipPort": lock.sip_port.to_string(),
             "selectedDevice": lock.selected_device.clone().unwrap_or_default(),
+            "selectedOutputDevice": lock.selected_output_device.clone().unwrap_or_default(),
             "localIp": get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
             "ampEnabled": lock.amp_enabled,
             "bridgeEnabled": lock.bridge_enabled

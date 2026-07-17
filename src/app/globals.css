@@ -55,6 +55,10 @@
   --font-mono: ui-monospace, monospace;
 }
 
+html {
+  touch-action: pan-x pan-y; /* disable pinch/double-tap zoom app-wide (scrolling still works) */
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
@@ -63,6 +67,8 @@ body {
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none; /* touchscreen: hold-to-PTT must not trigger the long-press callout/context menu */
+  touch-action: pan-x pan-y;
+  overscroll-behavior: none;
 }
 
 /* Sharp inputs/buttons */

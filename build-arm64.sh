@@ -48,7 +48,7 @@ info "Using webview package: ${WEBKIT_PKG}"
 sudo apt-get install -y \
   build-essential curl wget file pkg-config \
   libssl-dev libgtk-3-dev "${WEBKIT_PKG}" librsvg2-dev \
-  libayatana-appindicator3-dev libasound2-dev \
+  libayatana-appindicator3-dev libasound2-dev libudev-dev \
   patchelf desktop-file-utils
 
 # ---- 2. Rust toolchain ----------------------------------------------------

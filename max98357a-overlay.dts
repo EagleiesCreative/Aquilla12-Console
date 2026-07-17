@@ -1,0 +1,69 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "rockchip,rk3588";
+
+    metadata {
+        title = "MAX98357A I2S Audio DAC Overlay";
+        compatible = "radxa,rock-5b-plus", "rockchip,rk3588";
+        category = "sound";
+        description = "Enable MAX98357A I2S DAC/Amp on I2S2 (m1 pins 12, 35, 40)";
+    };
+
+    /* Enable I2S2 controller and route pins to the 40-pin header */
+    fragment@0 {
+        target = <&i2s2_2ch>;
+        __overlay__ {
+            compatible = "rockchip,rk3588-i2s-tdm";
+            status = "okay";
+            #sound-dai-cells = <0>;
+            clocks = <&cru 31>, <&cru 31>, <&cru 26>;
+            clock-names = "mclk_tx", "mclk_rx", "hclk";
+            assigned-clocks = <&cru 28>;
+            assigned-clock-parents = <&cru 4>;
+            rockchip,clk-trcm = <1>;
+            pinctrl-names = "default";
+            pinctrl-0 = <&i2s2m1_lrck &i2s2m1_sclk &i2s2m1_sdi &i2s2m1_sdo>;
+        };
+    };
+
+    /* Create the virtual sound card and link the CPU DAI to the Codec */
+    fragment@1 {
+        target-path = "/";
+        __overlay__ {
+            max98357a_codec: max98357a-codec {
+                #sound-dai-cells = <0>;
+                compatible = "linux,spdif-dit";
+                status = "okay";
+            };
+
+            max98357a_sound: max98357a-sound {
+                compatible = "simple-audio-card";
+                simple-audio-card,name = "MAX98357A";
+                simple-audio-card,format = "i2s";
+                
+                /* Rock 5B+ is the I2S clock master */
+                simple-audio-card,bitclock-master = <&cpu_dai>;
+                simple-audio-card,frame-master = <&cpu_dai>;
+                simple-audio-card,mclk-fs = <256>;
+
+                cpu_dai: simple-audio-card,cpu {
+                    sound-dai = <&i2s2_2ch>;
+                };
+
+                simple-audio-card,codec {
+                    sound-dai = <&max98357a_codec>;
+                };
+            };
+        };
+    };
+
+    /* Disable the conflicting sound-max98357a node from the base device tree */
+    fragment@2 {
+        target-path = "/sound-max98357a";
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+};

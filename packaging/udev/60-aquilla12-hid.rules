@@ -1,0 +1,15 @@
+# Aquilla 12 control surface — grant hidraw access without root.
+#
+# idVendor is the pid.codes shared VID (https://pid.codes/1209/). idProduct
+# below is a placeholder (0xA612, matching hid_panel::DEFAULT_PRODUCT_ID) —
+# replace it with the project's actual pid.codes-registered PID once issued,
+# and keep it in sync with hid_panel_config.json's "productId" if you override
+# it there.
+#
+# TAG+="uaccess" grants access to the user at the active (systemd-logind)
+# seat automatically — this is what most modern desktop/kiosk sessions use,
+# no group membership needed. GROUP="plugdev" MODE="0660" is kept as a
+# fallback for systems without logind ACLs (e.g. minimal/headless images);
+# add your runtime user to the "plugdev" group for that path to take effect:
+#   sudo usermod -aG plugdev <user>
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="a612", MODE="0660", GROUP="plugdev", TAG+="uaccess"

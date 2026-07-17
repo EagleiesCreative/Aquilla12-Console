@@ -61,6 +61,8 @@ export interface GlobalSettings {
   isConnected: boolean;
   selectedDevice: string;
   availableDevices: string[];
+  selectedOutputDevice: string;
+  availableOutputDevices: string[];
   localIp?: string;
   ampEnabled?: boolean;
   bridgeEnabled?: boolean;
