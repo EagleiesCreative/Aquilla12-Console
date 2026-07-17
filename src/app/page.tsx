@@ -666,7 +666,7 @@ export default function Home() {
   const isSecure = channels.every(c => c.srtpEnabled);
 
   return (
-    <div className="w-[800px] h-[480px] overflow-hidden flex flex-col bg-zinc-100 text-zinc-900 font-sans select-none relative">
+    <div className="w-screen h-screen overflow-hidden flex flex-col bg-zinc-100 text-zinc-900 font-sans select-none relative">
       {/* Dashboard Header */}
       <DashboardHeader
         settings={settings}

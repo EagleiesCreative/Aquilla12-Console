@@ -13,9 +13,9 @@
     "windows": [
       {
         "title": "Aquilla-12",
-        "width": 800,
-        "height": 480,
-        "resizable": false,
+        "width": 1280,
+        "height": 800,
+        "resizable": true,
         "fullscreen": true,
         "decorations": false
       }

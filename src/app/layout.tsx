@@ -17,7 +17,7 @@ export const metadata: Metadata = {
   description: "12-Channel I2S Hardware Mapping & SIP Diagnostic Portal",
 };
 
-// Lock the viewport for the 800x480 touchscreen: no user zoom / pinch scaling.
+// Responsive viewport (fills any display); disable user zoom / pinch scaling for touch.
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
