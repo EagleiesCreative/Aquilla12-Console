@@ -59,6 +59,14 @@ html {
   touch-action: pan-x pan-y; /* disable pinch/double-tap zoom app-wide (scrolling still works) */
 }
 
+/* Kiosk touchscreen: hide the mouse cursor everywhere. The WaveShare panel also
+   registers as a pointer, which would otherwise show a cursor at screen center. */
+*,
+*::before,
+*::after {
+  cursor: none !important;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);

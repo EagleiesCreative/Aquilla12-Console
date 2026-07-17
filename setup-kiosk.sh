@@ -174,7 +174,17 @@ cat > "$USER_HOME/kiosk-start.sh" << KIOSKEOF
 
 export XDG_RUNTIME_DIR="/run/user/\$(id -u)"
 export LIBSEAT_BACKEND=seatd
-export WLR_RENDERER=gles2
+# --- Software rendering (REQUIRED on this image) ---------------------------
+# The RK3588 Mali GPU has no working EGL/GLES driver in the vendor-kernel
+# Armbian image, so cage's default GLES2 renderer fails with
+#   "Failed to create a GLES2 renderer / Unable to create the wlroots renderer"
+# and the screen stays blank. Pixman renders on the CPU — slower but reliable.
+# The matching WebKit/GDK flags stop the WebView from trying (and failing) GL.
+export WLR_RENDERER=pixman
+export LIBGL_ALWAYS_SOFTWARE=1
+export WEBKIT_DISABLE_COMPOSITING_MODE=1
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+export GDK_GL=disable
 export GDK_BACKEND=wayland
 # Audio output is chosen in the Aquilla console (Settings → Audio Output
 # Interface) and persisted per-device. Do NOT export AQUILLA_OUTPUT_DEVICE
@@ -186,6 +196,21 @@ mkdir -p "\$XDG_RUNTIME_DIR" 2>/dev/null || true
 
 # Wait for seatd to be ready
 sleep 1
+
+# Wait (up to 20s) for the USB touchscreen to enumerate BEFORE launching cage.
+# cage scans input devices once at startup; if it starts before the panel is
+# up, touch won't work until a restart. This blocks until a touchscreen exists.
+for _ in \$(seq 1 20); do
+    for d in /dev/input/event*; do
+        [ -e "\$d" ] || continue
+        if udevadm info --query=property "\$d" 2>/dev/null | grep -q '^ID_INPUT_TOUCHSCREEN=1'; then
+            touch_ready=1
+            break
+        fi
+    done
+    [ "\${touch_ready:-}" = "1" ] && break
+    sleep 1
+done
 
 # Launch cage with Aquilla-12 in fullscreen
 exec cage -s -- $APP_BIN
