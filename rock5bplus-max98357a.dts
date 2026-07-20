@@ -1,0 +1,44 @@
+// Device tree overlay: MAX98357A I2S DAC/amp on ROCK 5B+ (RK3588)
+// Uses I2S2 (M1 pinmux) on the 40-pin header: pins 12 (BCLK), 35 (LRC), 40 (DIN)
+// Install on Armbian with: sudo armbian-add-overlay rock5bplus-max98357a.dts
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "radxa,rock-5b-plus", "radxa,rock-5b", "rockchip,rk3588";
+
+	fragment@0 {
+		target-path = "/";
+		__overlay__ {
+			max98357a: max98357a {
+				compatible = "maxim,max98357a";
+				#sound-dai-cells = <0>;
+				// Optional: control the SD/MODE pin from a GPIO instead of
+				// leaving it floating. Uncomment and wire SD to pin 33 (GPIO3_A7):
+				// sdmode-gpios = <&gpio3 7 0>; // RK_PA7, GPIO_ACTIVE_HIGH
+			};
+
+			sound_i2s2: i2s2-sound {
+				compatible = "simple-audio-card";
+				simple-audio-card,name = "Aquilla Speakers";
+				simple-audio-card,format = "i2s";
+				simple-audio-card,mclk-fs = <256>;
+
+				simple-audio-card,cpu {
+					sound-dai = <&i2s2_2ch>;
+				};
+				simple-audio-card,codec {
+					sound-dai = <&max98357a>;
+				};
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&i2s2_2ch>;
+		__overlay__ {
+			status = "okay";
+			#sound-dai-cells = <0>;
+		};
+	};
+};

@@ -1,3 +1,14 @@
+// ============================================================
+// ⛔ DEPRECATED — DO NOT USE (v1, never worked)
+// ============================================================
+// This overlay (dummy spdif-dit codec + hand-patched clock IDs) never
+// produced a working sound card, and worse: when its .dtbo is left in
+// user_overlays it aborts U-Boot's overlay chain and breaks the working
+// overlay too. setup-max98357a.sh v2 removes it from the board.
+// Use rock5bplus-max98357a.dts instead (VERIFIED WORKING 2026-07-20):
+// real maxim,max98357a codec + stock i2s2_2ch, card "Aquilla Speakers".
+// Kept only for historical reference.
+// ============================================================
 /dts-v1/;
 /plugin/;
 
